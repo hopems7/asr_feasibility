@@ -1,0 +1,48 @@
+# Builds asr_feasibility.exe on a Windows machine hosted by GitHub, tests it,
+# and makes it available as a downloadable artifact.
+# Run it from the repository's Actions tab ("Run workflow"), or by pushing a
+# change to asr_feasibility.py.
+name: Build Windows executable
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "asr_feasibility.py"
+      - ".github/workflows/build-windows.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install "numpy>=1.22" "imageio-ffmpeg>=0.4.9" "webrtcvad-wheels>=2.0.11" "pyinstaller>=6.0"
+
+      - name: Build
+        run: >
+          pyinstaller --noconfirm --clean --onefile --console
+          --collect-all imageio_ffmpeg
+          --exclude-module faster_whisper --exclude-module ctranslate2 --exclude-module torch
+          --exclude-module googleapiclient --exclude-module google_auth_oauthlib
+          --name asr_feasibility asr_feasibility.py
+
+      - name: Smoke test (synthetic audio, no system ffmpeg)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force smoke | Out-Null
+          python -c "import numpy as np, wave; sr=16000; t=np.arange(sr*20)/sr; x=(0.2*np.sin(2*np.pi*300*t)*((t%1.5)<1.0)*32767).astype(np.int16); w=wave.open('smoke/test.wav','wb'); w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(x.tobytes()); w.close()"
+          $env:PATH = "C:\Windows\System32"
+          $null | .\dist\asr_feasibility.exe smoke --output smoke_out
+          if (-not (Test-Path smoke_out\feasibility_report.txt)) { Write-Error "No report produced"; exit 1 }
+          Get-Content smoke_out\feasibility_report.txt -TotalCount 30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asr_feasibility-windows
+          path: dist/asr_feasibility.exe
