@@ -1,1 +1,8 @@
-
+# Keep sign-in files and outputs out of the repository
+client_secret*.json
+*token*.json
+asr_feasibility_output/
+build/
+dist/
+*.spec
+.build-venv/
