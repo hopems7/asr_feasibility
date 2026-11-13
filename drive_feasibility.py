@@ -254,6 +254,38 @@ def drive_year(item):
     return y if y and 1995 <= y <= time.localtime().tm_year + 1 else None
 
 
+def fill_unanalyzed(records):
+    """Give recordings that weren't downloaded a duration so they count toward
+    totals: Drive's video duration, or for audio-only files an estimate from file
+    size. Also turns 'no audio' results into the no-audio-track state. Returns
+    the number of durations estimated from size."""
+    # bytes per second from analyzed files: same folder and type first (usually the
+    # same recorder and settings), then same type anywhere, then everything
+    bps_dir, bps = {}, {}
+    for r in records:
+        a = r.get("analysis") or {}
+        d = (r.get("probe") or {}).get("duration_s")
+        if d and r["size"] and a.get("status") == "ok":
+            bps_dir.setdefault((str(r["path"].parent), r["ext"]), []).append(r["size"] / d)
+            bps.setdefault(r["ext"], []).append(r["size"] / d)
+    all_bps = [v for vs in bps.values() for v in vs]
+    estimated = 0
+    for r in records:
+        if r.get("probe") and r.get("analysis") is not None:
+            if r["analysis"].get("status") == "no_audio":
+                r["analysis"] = None   # treated like a file with no audio track
+            continue
+        dur = r["drive_duration_s"]
+        if dur is None:
+            ref = bps_dir.get((str(r["path"].parent), r["ext"])) or bps.get(r["ext"]) or all_bps
+            if ref and r["size"]:
+                dur = r["size"] / sorted(ref)[len(ref) // 2]
+                estimated += 1
+        r["probe"] = dict(af._empty_probe(), ok=True, has_audio=True, duration_s=dur)
+        r["analysis"] = None
+    return estimated
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -332,12 +364,12 @@ def main():
         shutil.rmtree(work, ignore_errors=True)
 
 
-def self_check(args):
+def self_check(args, name="drive_feasibility", summary=True):
     """Offline check of the installation: no sign-in and no network access."""
     ok = True
     def line(good, what, detail=""):
         print(f"  [{'OK' if good else '!!'}] {what}{(': ' + detail) if detail else ''}")
-    print(f"drive_feasibility v{af.TOOL_VERSION} installation check")
+    print(f"{name} v{af.TOOL_VERSION} installation check")
     ff = af.find_ffmpeg()
     line(bool(ff), "ffmpeg", "bundled/installed" if ff else "missing")
     ok &= bool(ff)
@@ -369,6 +401,8 @@ def self_check(args):
             ok = False
     else:
         line(False, "client_secret.json", f"not found at {cs} (needed before signing in)")
+    if not summary:
+        return 0 if ok else 1
     if not ok:
         print("Some items need attention (see above).")
     elif not cs.exists():
@@ -568,6 +602,7 @@ def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, 
             analysis = None
             if probe["has_audio"]:
                 analysis = af.analyze_file(tmp, ffmpeg, vad_method, max_s, not args.no_pitch)
+                analysis.pop("_frames", None)
             lid = None
             if model is not None and analysis and analysis.get("status") == "ok":
                 n = len(af.lid_windows(analysis, args.lid_windows_per_file))
@@ -620,31 +655,7 @@ def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, 
             return interrupted()
     print()
 
-    # --- recordings not downloaded: duration from Drive (video) or estimated from size
-    # bytes per second from analyzed files: same folder and type first (usually the
-    # same recorder and settings), then same type anywhere, then everything
-    bps_dir, bps = {}, {}
-    for r in records:
-        a = r.get("analysis") or {}
-        d = (r.get("probe") or {}).get("duration_s")
-        if d and r["size"] and a.get("status") == "ok":
-            bps_dir.setdefault((str(r["path"].parent), r["ext"]), []).append(r["size"] / d)
-            bps.setdefault(r["ext"], []).append(r["size"] / d)
-    all_bps = [v for vs in bps.values() for v in vs]
-    estimated = 0
-    for r in records:
-        if r.get("probe") and r.get("analysis") is not None:
-            if r["analysis"].get("status") == "no_audio":
-                r["analysis"] = None   # treated like a file with no audio track
-            continue
-        dur = r["drive_duration_s"]
-        if dur is None:
-            ref = bps_dir.get((str(r["path"].parent), r["ext"])) or bps.get(r["ext"]) or all_bps
-            if ref and r["size"]:
-                dur = r["size"] / sorted(ref)[len(ref) // 2]
-                estimated += 1
-        r["probe"] = dict(af._empty_probe(), ok=True, has_audio=True, duration_s=dur)
-        r["analysis"] = None
+    estimated = fill_unanalyzed(records)
 
     # --- labels and manifests
     index = {(str(r["path"].parent), r["path"].stem.lower()): r for r in records}
