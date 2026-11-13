@@ -71,7 +71,7 @@ from pathlib import Path
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
-TOOL_VERSION = "1.5.0"
+TOOL_VERSION = "1.6.0"
 
 # ---------------------------------------------------------------------------
 # Analysis constants
@@ -391,7 +391,7 @@ def yin_f0(windows):
     return f0
 
 
-def analyze_file(path, ffmpeg, vad_method, max_seconds, do_pitch):
+def analyze_file(path, ffmpeg, vad_method, max_seconds, do_pitch, keep_frames=False):
     """Decode a file and compute frame-level statistics. Returns a dict."""
     vad = None
     if vad_method == "webrtc":
@@ -498,7 +498,12 @@ def analyze_file(path, ffmpeg, vad_method, max_seconds, do_pitch):
         chunk_ratios.append(float(speech[pos:pos + n].mean()))
         pos += n
 
+    frames = None
+    if keep_frames:   # for drive_explore.py: frame-level arrays, used in memory only
+        frames = {"speech": speech, "f0": f0, "db": db,
+                  "bands": np.concatenate(band_rows), "band_frames": bidx}
     return {
+        "_frames": frames,
         "status": "ok",
         "analyzed_s": total_samples / SR,
         "speech_ratio": n_speech / len(speech),
@@ -564,7 +569,7 @@ class Checkpoint:
     def __init__(self, out_dir, settings, fresh=False):
         self.path = out_dir / self.FILENAME
         self.settings = settings
-        self.probes, self.analyses, self.lids = {}, {}, {}
+        self.probes, self.analyses, self.lids, self.extra = {}, {}, {}, {}
         self.resumed, self.reason = False, None
         if self.path.exists() and not fresh:
             self._load()
@@ -573,7 +578,7 @@ class Checkpoint:
         if self.resumed:
             self._fh = open(self.path, "a", encoding="utf-8")
         else:
-            self.probes, self.analyses, self.lids = {}, {}, {}
+            self.probes, self.analyses, self.lids, self.extra = {}, {}, {}, {}
             self._fh = open(self.path, "w", encoding="utf-8")
             self._write({"type": "header", "settings": settings})
 
@@ -601,6 +606,8 @@ class Checkpoint:
                 self.analyses[rec["k"]] = rec["v"]
             elif rec.get("type") == "lid":
                 self.lids[rec["k"]] = rec["v"]
+            elif rec.get("type"):
+                self.extra.setdefault(rec["type"], {})[rec["k"]] = rec["v"]
         if header is None:
             self.reason = "previous progress file was unreadable; starting fresh"
         elif header.get("settings") != self.settings:
@@ -621,9 +628,13 @@ class Checkpoint:
         self._write({"type": "probe", "k": key, "v": info})
 
     def save_analysis(self, key, result):
-        result = {k: v for k, v in result.items() if k != "error_detail"}  # may contain paths
+        result = {k: v for k, v in result.items() if k not in ("error_detail", "_frames")}
         self.analyses[key] = result
         self._write({"type": "analysis", "k": key, "v": result})
+
+    def save(self, kind, key, value):
+        self.extra.setdefault(kind, {})[key] = value
+        self._write({"type": kind, "k": key, "v": value})
 
     def save_lid(self, key, result):
         self.lids[key] = result
@@ -1030,7 +1041,7 @@ def _hash(v):
     return hashlib.sha1(str(v).encode("utf-8")).hexdigest()[:16]
 
 
-def match_manifests(paths, media_index):
+def match_manifests(paths, media_index, keep_text=False):
     """Scan candidate manifest files and attach transcription facts to recordings.
     Returns a dict of manifest-level statistics (counts and field names only)."""
     st = {"files_examined": 0, "manifests_used": 0, "files_skipped_too_large": 0,
@@ -1088,6 +1099,11 @@ def match_manifests(paths, media_index):
                     if not tval:
                         media["mf_prompt_chars"] = max(media.get("mf_prompt_chars", 0),
                                                        len(" ".join(qval.split())))
+                if keep_text:                       # drive_explore.py only
+                    if tval:
+                        media.setdefault("mf_texts", []).append(tval)
+                    if qval:
+                        media.setdefault("mf_prompts", []).append(qval)
                 tval = qval = None                  # discard the text
                 media["mf_entry"] = True
                 for fields, key, norm in ((SPEAKER_FIELDS, "mf_speaker", _hash),
@@ -1148,8 +1164,39 @@ def lang_name(code):
     return f"{LANG_NAMES.get(code, code)} ({code})"
 
 
+LID_MODEL_MB = {"tiny": 75, "base": 145, "small": 485, "medium": 1530}
+
+
+def app_dir():
+    """Folder the user sees: next to the .exe when frozen, else next to this script."""
+    return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else \
+        Path(__file__).resolve().parent
+
+
+def local_lid_model(size):
+    """A model folder shipped with the tool, if any: the given path itself, or
+    models/faster-whisper-<size> next to the program."""
+    p = Path(size)
+    candidates = [p] if p.is_absolute() or os.sep in size or "/" in size else []
+    candidates += [app_dir() / "models" / f"faster-whisper-{size}", app_dir() / f"faster-whisper-{size}"]
+    for c in candidates:
+        if (c / "model.bin").exists():
+            return str(c)
+    return None
+
+
 def load_lid_model(size):
-    """Load a faster-whisper model, on a GPU if one is available. Returns (model, error)."""
+    """Load a faster-whisper model, on a GPU if one is available. Uses a model
+    folder shipped next to the program if there is one; otherwise downloads the
+    model once (it is then cached). Returns (model, error)."""
+    try:
+        import av  # noqa: F401
+    except ImportError:
+        # faster-whisper imports PyAV on startup but only uses it to decode audio
+        # files itself; this tool always passes decoded audio, so a placeholder
+        # module lets the executable leave PyAV (and its own ffmpeg copy) out.
+        import types
+        sys.modules.setdefault("av", types.ModuleType("av"))
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -1161,10 +1208,18 @@ def load_lid_model(size):
             device, ctype = "cuda", "float16"
     except Exception:
         pass
+    local = local_lid_model(size)
+    if local:
+        print(f"  Using the language model in {local}")
+    else:
+        mb = LID_MODEL_MB.get(size)
+        print(f"  Downloading the Whisper '{size}' model"
+              + (f" (about {mb} MB)" if mb else "") + "; this happens once and needs internet...")
     try:
-        return WhisperModel(size, device=device, compute_type=ctype), None
+        return WhisperModel(local or size, device=device, compute_type=ctype), None
     except Exception as e:  # model download or load failure
-        return None, f"skipped: could not load the model ({type(e).__name__})"
+        where = "the shipped model folder" if local else "the model (no internet?)"
+        return None, f"skipped: could not load {where} ({type(e).__name__})"
 
 
 def lid_windows(analysis, k):
@@ -2117,7 +2172,9 @@ def main():
 
     def do_analyze(r):
         try:
-            return analyze_file(r["path"], ffmpeg, vad_method, max_s, not args.no_pitch)
+            res = analyze_file(r["path"], ffmpeg, vad_method, max_s, not args.no_pitch)
+            res.pop("_frames", None)
+            return res
         except _Stopped:
             return None
         except Exception as e:
