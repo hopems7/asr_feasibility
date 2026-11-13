@@ -1,0 +1,105 @@
+# Builds drive_explore_lid.exe: the in-depth Google Drive explorer with language
+# checks always on. Also packages the Whisper model it needs, and tests the
+# program with that model on Windows. Pushing a tag such as v1.0.0 publishes
+# both on a GitHub Release.
+#
+# Needs these four files at the top of the repository:
+#   asr_feasibility.py  drive_feasibility.py  drive_explore.py  drive_explore_lid.py
+# Never commit client_secret.json.
+# For a smaller model, change LID_MODEL to "base" (about 145 MB instead of 485 MB).
+name: Build drive_explore_lid
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+env:
+  LID_MODEL: small
+
+jobs:
+  model:
+    name: Package the Whisper model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download faster-whisper-${{ env.LID_MODEL }}
+        run: |
+          python -m pip install "huggingface_hub>=0.21"
+          python -c "from huggingface_hub import snapshot_download; snapshot_download('Systran/faster-whisper-${LID_MODEL}', local_dir='models/faster-whisper-${LID_MODEL}')"
+          rm -rf models/faster-whisper-${LID_MODEL}/.cache
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-faster-whisper-${{ env.LID_MODEL }}
+          path: models/
+
+  build:
+    name: Build and test drive_explore_lid
+    needs: model
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: >
+          python -m pip install "numpy>=1.22" "imageio-ffmpeg>=0.4.9" "webrtcvad-wheels>=2.0.11"
+          "google-api-python-client>=2.100" "google-auth-oauthlib>=1.0" "faster-whisper>=1.0"
+          "pyinstaller>=6.0"
+
+      - name: Build
+        run: >
+          pyinstaller --noconfirm --clean --onefile --console
+          --collect-all imageio_ffmpeg --collect-data googleapiclient
+          --collect-all ctranslate2 --collect-data faster_whisper
+          --exclude-module av --exclude-module hf_xet --exclude-module onnxruntime
+          --exclude-module torch --exclude-module scipy
+          --name drive_explore_lid drive_explore_lid.py
+
+      - name: Get the packaged model
+        uses: actions/download-artifact@v4
+        with:
+          name: model-faster-whisper-${{ env.LID_MODEL }}
+          path: dist/models
+
+      - name: Test with the real model (offline, no sign-in, no system ffmpeg)
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Windows\System32"
+          $env:HF_HUB_OFFLINE = "1"
+          .\dist\drive_explore_lid.exe --check
+          if ($LASTEXITCODE -ne 0) { Write-Error "Check failed: the program or its language model isn't working"; exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drive_explore_lid-windows
+          path: dist/drive_explore_lid.exe
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect files
+        run: |
+          mkdir -p dist pkg/models
+          cp artifacts/drive_explore_lid-windows/drive_explore_lid.exe dist/
+          cp -r artifacts/model-faster-whisper-${LID_MODEL}/* pkg/models/
+          (cd pkg && zip -r ../dist/models-faster-whisper-${LID_MODEL}.zip models)
+      - name: Publish the program and the model
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: >
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
+          --title "$TAG" --notes "drive_explore_lid for Windows. Unzip the models zip next to the .exe."
