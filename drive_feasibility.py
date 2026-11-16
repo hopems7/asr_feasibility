@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-ASR data feasibility check for Google Drive
-===========================================
+ASR data feasibility check for Google Drive storage
 
 Runs the same analysis as asr_feasibility.py on recordings stored in a Google
 Drive folder (My Drive or a shared drive), including all subfolders.
 
-How it works
-------------
+How it works:
 1. Signs in to Google with read-only access (a browser window opens once).
 2. Lists every file in the folder tree. This uses only Drive metadata, so the
    inventory, file sizes, video durations and duplicates are known without
@@ -23,8 +21,7 @@ slow or metered connection. Files not downloaded still count toward totals
 (video durations come from Drive; audio-only durations are estimated from file
 size), and speech figures are extrapolated from the analyzed sample.
 
-Privacy
--------
+Privacy:
 * Read-only access. Nothing in Drive is changed, moved or shared.
 * Downloads go to a temporary folder on this computer and are deleted after
   each file is analyzed; the folder itself is removed at the end.
