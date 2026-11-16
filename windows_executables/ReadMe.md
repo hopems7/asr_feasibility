@@ -1,5 +1,4 @@
 # Executable Explanations
 
 
-asr_feasibility-windows: Regular feasibility script that reads files locally
-
+Original executable file for asr_feasibility.py
