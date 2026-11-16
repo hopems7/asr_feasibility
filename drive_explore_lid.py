@@ -3,7 +3,7 @@
 Language id checks always on when utilizing this program: 
 
 
-A backup program for when you have full, unrestricted access to the data. It is
+A program for when you have full, unrestricted access to the data. It is
 drive_explore.py with Whisper language identification permanently switched on:
 there is no option to turn it off. If the language model can't be loaded, it
 asks whether to continue without language checks, and only continues if told to.
