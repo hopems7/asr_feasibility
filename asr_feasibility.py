@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-ASR data feasibility check
-==========================
+ASR feasibility check for local storage only
 
-Scans a folder of audio and video files and produces an AGGREGATE report that
+Scans a folder of audio and video files and produces an aggregate report that
 helps judge whether the recordings could be useful for fine-tuning a speech
 recognition model on children's speech.
 
-Privacy design
---------------
+Privacy design:
 * Nothing is uploaded or sent anywhere. The tool only reads files and writes a
   report to a local folder.
-* The shareable report contains only totals and distributions. It contains no
+* The shareable report contains only totals and distributions. It does not contain
   file names, folder names, transcripts, audio, or per-file details.
 * An optional per-file table (--per-file) is written to a separate file marked
   LOCAL ONLY, for the data owner's own use.
@@ -26,16 +24,13 @@ Privacy design
   locations are never stored or reported; speakers and locations are only
   counted, and age and gender groups under 5 recordings are combined.
 
-Interruptions
--------------
-Progress is saved after every file. If the run is interrupted (power cut,
-computer shutdown, closing the window, Ctrl+C), run the tool again on the same
+Connection Interruptions:
+Progress is saved after every file. If the run is interrupted, run the tool again on the same
 folder with the same settings and it continues where it left off. The progress
 file stores only hashed file IDs and statistics, never file names, and is
 deleted automatically when the run finishes.
 
-Usage
------
+Usage:
     python asr_feasibility.py                    # opens a folder picker
     python asr_feasibility.py "D:/Recordings"    # scan a specific folder
     python asr_feasibility.py "D:/Recordings" --max-minutes-per-file 10
@@ -45,6 +40,8 @@ Usage
 Requirements: Python 3.9+, numpy, and ffmpeg (either installed on the system
 or via the imageio-ffmpeg package). Optional: webrtcvad-wheels (better speech
 detection), faster-whisper (language identification).
+
+Language id is automaically set to off unless the user sets it to true in the command line.
 """
 from __future__ import annotations
 
