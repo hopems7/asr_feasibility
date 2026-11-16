@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-drive_explore with language checks always on
-============================================
+Language id checks always on when utilizing this program: 
+
 
 A backup program for when you have full, unrestricted access to the data. It is
 drive_explore.py with Whisper language identification permanently switched on:
@@ -15,6 +15,9 @@ is there, the model is downloaded once (about 485 MB for 'small').
 Usage: as drive_explore.py, for example
     drive_explore_lid "https://drive.google.com/drive/folders/XXXX" --sample-files 300
     drive_explore_lid --check        # installation check, including a test run of the model
+
+
+This script is only utilized in the drive_explore_lid executable. 
 """
 import sys
 from pathlib import Path
