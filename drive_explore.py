@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-In-depth exploration of recordings in a Google Drive folder
-===========================================================
+In-depth exploration of recordings in a Google Drive folder. Only for use with fewer
+data privacy restrictions. 
 
 For use when you are permitted to see the data itself. Like drive_feasibility.py,
 it reads straight from Google Drive: each recording is downloaded to a temporary
@@ -31,8 +31,7 @@ on a machine and in a location your data agreement allows, never commit it to
 GitHub, and delete it when the agreement says. --report-only writes only the
 aggregate reports and the folder map.
 
-Usage
------
+Usage:
     python drive_explore.py "https://drive.google.com/drive/folders/XXXX"
     python drive_explore.py FOLDER_LINK --max-download-gb 20 --wordlists kenyan_words.json
 """
