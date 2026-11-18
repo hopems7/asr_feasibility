@@ -287,6 +287,8 @@ Progress is written to `resume_checkpoint__LOCAL_ONLY.jsonl` in the output folde
 - **Ctrl+C or closing the window:** workers stop within about a second, finished files are kept, and the tool exits with a message explaining how to resume.
 - **Not checkpointed:** the optional `--language-id` step, which runs last and is redone in full if interrupted.
 
+  Reclick the executable to restart, otherwise use the command ".\drive_feasibility-windows.exe", along with the same arguments previously used like --worker, --keep-checkpoint, etc
+
 ### Interpreting the report
 
 | Signal | Encouraging | Concerning |
