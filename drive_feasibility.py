@@ -201,10 +201,14 @@ def _safe(name):
     return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip() or "_"
 
 
-def walk(drive, root_id, workers=LIST_WORKERS):
-    """All files under root_id (recursively, following shortcuts) with their
-    relative paths. Lists several folders at once and shows a running count.
-    Returns (items, folder_count)."""
+def walk(drive, root_id, workers=LIST_WORKERS, follow_shortcuts=True, stats=None):
+    """All files under root_id and all its subfolders, with their relative paths.
+    Drive shortcuts are followed to their targets (which may be outside the
+    folder) unless follow_shortcuts is False, in which case they're skipped and
+    counted. Lists several folders at once and shows a running count.
+    Returns (items, folder_count); fills stats with shortcut counts if given."""
+    stats = {} if stats is None else stats
+    stats.update(shortcuts_followed=0, shortcuts_skipped=0)
     from concurrent.futures import FIRST_COMPLETED, wait
     try:
         root_drive = drive.get(root_id).get("driveId")
@@ -226,6 +230,10 @@ def walk(drive, root_id, workers=LIST_WORKERS):
                     for f in children:
                         name = _safe(f.get("name", ""))
                         if f.get("mimeType") == SHORTCUT_MIME:
+                            if not follow_shortcuts:
+                                stats["shortcuts_skipped"] += 1
+                                continue
+                            stats["shortcuts_followed"] += 1
                             sd = f.get("shortcutDetails") or {}
                             tid = sd.get("targetId")
                             if not tid:
@@ -338,6 +346,9 @@ def main():
     ap.add_argument("--max-minutes-per-file", type=float, default=None,
                     help="Analyze at most this many minutes of each file (still downloads it)")
     ap.add_argument("--workers", type=int, default=2, help="Parallel downloads (default 2)")
+    ap.add_argument("--no-shortcuts", action="store_true",
+                    help="Don't follow Drive shortcuts, so nothing outside the folder (and its "
+                         "subfolders) is read; skipped shortcuts are counted in the report")
     ap.add_argument("--vad", choices=["auto", "webrtc", "energy"], default="auto")
     ap.add_argument("--no-pitch", action="store_true")
     ap.add_argument("--language-id", action="store_true",
@@ -459,9 +470,11 @@ def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, 
         print(f"Sign-in did not complete ({type(e).__name__}). Check the internet connection")
         print("and try again; on the Google page, choose the account that can see the folder.")
         return af.finish(interactive, 1)
-    print("Listing files in the Drive folder...")
+    print("Listing files in the Drive folder"
+          + (" (shortcuts are not followed)..." if args.no_shortcuts else "..."))
+    walk_stats = {}
     try:
-        items, n_folders = walk(drive, root_id)
+        items, n_folders = walk(drive, root_id, follow_shortcuts=not args.no_shortcuts, stats=walk_stats)
     except af._Stopped:
         return af.finish(interactive, 130)
     except Exception as e:
@@ -469,6 +482,8 @@ def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, 
         print("signed-in account can open it.")
         return af.finish(interactive, 1)
     print(f"  {len(items)} files in {n_folders} folders.")
+    if walk_stats["shortcuts_skipped"]:
+        print(f"  {walk_stats['shortcuts_skipped']} shortcuts skipped (--no-shortcuts).")
 
     # --- sort into recordings and label files
     media_items, caption_items, doc_paths, manifest_items = [], [], [], []
@@ -705,6 +720,7 @@ def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, 
         lid_status["files_selected"] = sum(1 for r in records if (r.get("lid") or {}).get("status") == "ok")
     settings = {
         "source": "Google Drive",
+        "follow_shortcuts": not args.no_shortcuts,
         "max_minutes_per_file": args.max_minutes_per_file,
         "sample_files": args.sample_files or (len(order) if len(order) < len(records) else None),
         "max_download_gb": args.max_download_gb,
@@ -727,6 +743,8 @@ def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, 
         "google_docs_counted_by_name": gdocs,
         "google_sheets_checked_as_manifests": gsheets,
         "label_files_not_downloaded": label_dl_failed,
+        "shortcuts_followed": walk_stats["shortcuts_followed"],
+        "shortcuts_skipped": walk_stats["shortcuts_skipped"],
     }
     report["google_drive"] = drive_info
     text = af.render_text(report)
