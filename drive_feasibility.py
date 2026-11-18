@@ -72,7 +72,7 @@ SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 GDOC_MIME = "application/vnd.google-apps.document"
 GSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 LIST_FIELDS = ("nextPageToken, files(id, name, mimeType, size, md5Checksum, createdTime, "
-               "modifiedTime, videoMediaMetadata(durationMillis), "
+               "modifiedTime, driveId, videoMediaMetadata(durationMillis), "
                "shortcutDetails(targetId, targetMimeType), capabilities(canDownload))")
 FILE_FIELDS = LIST_FIELDS[len("nextPageToken, files("):-1]
 CAPTION_MAX_BYTES = 50_000_000
@@ -84,6 +84,8 @@ MIME_EXT = {"audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/wav": ".wav", "aud
             "video/3gpp": ".3gp", "video/x-msvideo": ".avi", "video/x-matroska": ".mkv",
             "video/mpeg": ".mpg", "video/x-ms-wmv": ".wmv"}
 TOKEN_PATH = Path.home() / ".asr_feasibility" / "drive_token__LOCAL_ONLY.json"
+UNKNOWN_DRIVE = "?"            # list_children: look up which drive a folder is on
+LIST_WORKERS = 8               # folders listed at the same time (well within Drive quotas)
 
 
 # ---------------------------------------------------------------------------
@@ -140,13 +142,23 @@ class DriveClient:
         return self.svc.files().get(fileId=file_id, fields=FILE_FIELDS,
                                     supportsAllDrives=True).execute(num_retries=5)
 
-    def list_children(self, folder_id):
+    def list_children(self, folder_id, drive_id=None):
+        """Items directly inside a folder. Searches only the drive the folder is on
+        (its shared drive, or My Drive and files shared with the user) rather than
+        every shared drive the account can see, which can be much slower.
+        drive_id=UNKNOWN_DRIVE looks the folder's drive up first (for shortcuts)."""
+        if drive_id == UNKNOWN_DRIVE:
+            try:
+                drive_id = self.get(folder_id).get("driveId")
+            except Exception:
+                drive_id = None
+        scope = {"corpora": "drive", "driveId": drive_id} if drive_id else {"corpora": "user"}
         out, token = [], None
         while True:
             resp = self.svc.files().list(
                 q=f"'{folder_id}' in parents and trashed = false", fields=LIST_FIELDS,
-                pageSize=1000, pageToken=token, corpora="allDrives",
-                supportsAllDrives=True, includeItemsFromAllDrives=True).execute(num_retries=5)
+                pageSize=1000, pageToken=token, supportsAllDrives=True,
+                includeItemsFromAllDrives=True, **scope).execute(num_retries=5)
             out.extend(resp.get("files", []))
             token = resp.get("nextPageToken")
             if not token:
@@ -189,43 +201,69 @@ def _safe(name):
     return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip() or "_"
 
 
-def walk(drive, root_id):
+def walk(drive, root_id, workers=LIST_WORKERS):
     """All files under root_id (recursively, following shortcuts) with their
-    relative paths. Returns (items, folder_count)."""
+    relative paths. Lists several folders at once and shows a running count.
+    Returns (items, folder_count)."""
+    from concurrent.futures import FIRST_COMPLETED, wait
+    try:
+        root_drive = drive.get(root_id).get("driveId")
+    except Exception:
+        root_drive = UNKNOWN_DRIVE
+    raw, visited = [], {root_id}
+    folders_done, t0, shown = 0, time.time(), 0.0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        pending = {ex.submit(drive.list_children, root_id, root_drive): ""}
+        try:
+            while pending:
+                if af.STOP.is_set():
+                    raise af._Stopped()
+                done, _ = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    rel = pending.pop(fut)
+                    children = fut.result()
+                    folders_done += 1
+                    for f in children:
+                        name = _safe(f.get("name", ""))
+                        if f.get("mimeType") == SHORTCUT_MIME:
+                            sd = f.get("shortcutDetails") or {}
+                            tid = sd.get("targetId")
+                            if not tid:
+                                continue
+                            if sd.get("targetMimeType") == FOLDER_MIME:
+                                if tid not in visited:
+                                    visited.add(tid)
+                                    pending[ex.submit(drive.list_children, tid, UNKNOWN_DRIVE)] = f"{rel}{name}/"
+                                continue
+                            try:
+                                f = drive.get(tid)
+                            except Exception:
+                                continue
+                            name = _safe(f.get("name", name))
+                        if f.get("mimeType") == FOLDER_MIME:
+                            if f["id"] not in visited:
+                                visited.add(f["id"])
+                                pending[ex.submit(drive.list_children, f["id"], f.get("driveId"))] = f"{rel}{name}/"
+                            continue
+                        raw.append((f"{rel}{name}", f))
+                if time.time() - shown >= 0.5 or not pending:
+                    shown = time.time()
+                    print(f"  Listing: {folders_done} folders scanned, {len(raw)} files found, "
+                          f"{len(pending)} folders waiting, {shown - t0:.0f} s   ", end="\r", flush=True)
+        except BaseException:
+            af.STOP.set()            # let queued listings return quickly
+            for fut in pending:
+                fut.cancel()
+            raise
+    print()
+    # Drive allows identical names in one folder; resolve them the same way every run
     items, used = [], set()
-    stack, visited = [(root_id, "")], {root_id}
-    while stack:
-        if af.STOP.is_set():
-            raise af._Stopped()
-        fid, rel = stack.pop()
-        for f in drive.list_children(fid):
-            name = _safe(f.get("name", ""))
-            if f.get("mimeType") == SHORTCUT_MIME:
-                sd = f.get("shortcutDetails") or {}
-                tid = sd.get("targetId")
-                if not tid:
-                    continue
-                if sd.get("targetMimeType") == FOLDER_MIME:
-                    if tid not in visited:
-                        visited.add(tid)
-                        stack.append((tid, f"{rel}{name}/"))
-                    continue
-                try:
-                    f = drive.get(tid)
-                except Exception:
-                    continue
-                name = _safe(f.get("name", name))
-            if f.get("mimeType") == FOLDER_MIME:
-                if f["id"] not in visited:
-                    visited.add(f["id"])
-                    stack.append((f["id"], f"{rel}{name}/"))
-                continue
-            path = f"{rel}{name}"
-            if path.lower() in used:  # Drive allows identical names in one folder
-                p = Path(path)
-                path = str(p.with_name(f"{p.stem}~{f['id'][:6]}{p.suffix}")).replace(os.sep, "/")
-            used.add(path.lower())
-            items.append(dict(f, rel=path))
+    for path, f in sorted(raw, key=lambda t: (t[0].lower(), t[1]["id"])):
+        if path.lower() in used:
+            p = Path(path)
+            path = str(p.with_name(f"{p.stem}~{f['id'][:6]}{p.suffix}")).replace(os.sep, "/")
+        used.add(path.lower())
+        items.append(dict(f, rel=path))
     return items, len(visited)
 
 
