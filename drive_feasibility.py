@@ -35,9 +35,7 @@ Setup (once, by the engineer): see README.md, "Google Drive". In short, create
 an OAuth client of type "Desktop app" in a Google Cloud project and save its
 JSON file as client_secret.json next to this script.
 
-**Note: asr_feasibility called as asr_feasibility_metadata in VS Code to retain versions -> import revision
-
-Usage: 
+Usage:
     python drive_feasibility.py                         # asks for the folder link
     python drive_feasibility.py "https://drive.google.com/drive/folders/XXXX"
     python drive_feasibility.py FOLDER_LINK --max-download-gb 20
@@ -109,10 +107,16 @@ class DriveClient:
             except Exception:
                 creds = None
         if creds and creds.expired and creds.refresh_token:
+            from google.auth.exceptions import TransportError
             try:
                 creds.refresh(Request())
+            except TransportError:
+                # Google couldn't be reached (no internet): don't open a sign-in page,
+                # which would wait forever in an unattended run; exit so it can retry
+                raise SystemExit("Couldn't reach Google to renew the sign-in. Check the internet "
+                                 "connection and try again; progress is kept.")
             except Exception:
-                creds = None  # e.g. a testing-mode token older than 7 days
+                creds = None  # e.g. a testing-mode token older than 7 days: sign in again
         if not creds or not creds.valid:
             if not Path(client_secret).exists():
                 raise SystemExit(f"Sign-in file not found: {client_secret}\n"
