@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-ASR feasibility check for local storage only
+ASR data feasibility check
 
-Scans a folder of audio and video files and produces an aggregate report that
+Scans a folder of audio and video files and produces an AGGREGATE report that
 helps judge whether the recordings could be useful for fine-tuning a speech
 recognition model on children's speech.
 
 Privacy design:
 * Nothing is uploaded or sent anywhere. The tool only reads files and writes a
   report to a local folder.
-* The shareable report contains only totals and distributions. It does not contain
+* The shareable report contains only totals and distributions. It contains no
   file names, folder names, transcripts, audio, or per-file details.
 * An optional per-file table (--per-file) is written to a separate file marked
   LOCAL ONLY, for the data owner's own use.
@@ -24,11 +24,14 @@ Privacy design:
   locations are never stored or reported; speakers and locations are only
   counted, and age and gender groups under 5 recordings are combined.
 
-Connection Interruptions:
-Progress is saved after every file. If the run is interrupted, run the tool again on the same
+Interruptions: 
+Progress is saved after every file. If the run is interrupted (power cut,
+computer shutdown, closing the window, Ctrl+C), run the tool again on the same
 folder with the same settings and it continues where it left off. The progress
 file stores only hashed file IDs and statistics, never file names, and is
 deleted automatically when the run finishes.
+
+
 
 Usage:
     python asr_feasibility.py                    # opens a folder picker
@@ -40,8 +43,6 @@ Usage:
 Requirements: Python 3.9+, numpy, and ffmpeg (either installed on the system
 or via the imageio-ffmpeg package). Optional: webrtcvad-wheels (better speech
 detection), faster-whisper (language identification).
-
-Language id is automaically set to off unless the user sets it to true in the command line.
 """
 from __future__ import annotations
 
@@ -288,9 +289,13 @@ def probe_ffmpeg_stderr(path, ffmpeg):
     return info
 
 
-def decode_chunks(path, ffmpeg, start=None, max_seconds=None, status=None):
-    """Yield int16 mono 16 kHz chunks of the first audio stream."""
+def decode_chunks(path, ffmpeg, start=None, max_seconds=None, status=None, fast_seek=False):
+    """Yield int16 mono 16 kHz chunks of the first audio stream. fast_seek jumps
+    straight to the start position in formats like MP3, instead of reading up to
+    it (used when reading clips through the Drive relay)."""
     cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error"]
+    if fast_seek:
+        cmd += ["-fflags", "+fastseek"]
     if start:
         cmd += ["-ss", f"{start:.3f}"]
     cmd += ["-i", str(path), "-map", "0:a:0", "-vn", "-sn", "-dn",
@@ -388,7 +393,10 @@ def yin_f0(windows):
     return f0
 
 
-def analyze_file(path, ffmpeg, vad_method, max_seconds, do_pitch, keep_frames=False):
+def analyze_file(path, ffmpeg, vad_method, max_seconds, do_pitch, keep_frames=False, segments=None):
+    """Decode a file (or URL) and compute frame-level statistics. With segments, a
+    list of (start_s, duration_s), only those clips are decoded and analyzed;
+    speech runs are measured within each clip."""
     """Decode a file and compute frame-level statistics. Returns a dict."""
     vad = None
     if vad_method == "webrtc":
@@ -400,37 +408,43 @@ def analyze_file(path, ffmpeg, vad_method, max_seconds, do_pitch, keep_frames=Fa
     total_samples = 0
     clipped = 0
     status = {}
-    for x in decode_chunks(path, ffmpeg, max_seconds=max_seconds, status=status):
-        if STOP.is_set():
-            raise _Stopped()
-        n = len(x) // FRAME
-        if n == 0:
-            continue
-        xi = x[:n * FRAME]
-        total_samples += len(xi)
-        clipped += int(np.count_nonzero(np.abs(xi.astype(np.int32)) >= CLIP_LEVEL))
-        xf = xi.astype(np.float32) / 32768.0
-        fr = xf.reshape(n, FRAME)
-        dbs.append(10.0 * np.log10(np.mean(fr * fr, axis=1) + 1e-10))
-        if vad is not None:
-            vads.append(np.fromiter(
-                (vad.is_speech(xi[i * FRAME:(i + 1) * FRAME].tobytes(), SR) for i in range(n)),
-                dtype=bool, count=n))
-        f0 = np.full(n, np.nan, dtype=np.float32)
-        if do_pitch:
-            starts = np.arange(0, n, PITCH_EVERY) * FRAME
-            starts = starts[starts + FRAME + MAX_LAG <= len(xf)]
-            if len(starts):
-                win = sliding_window_view(xf, FRAME + MAX_LAG)[starts]
-                f0[starts // FRAME] = yin_f0(win)
-        f0s.append(f0)
-        # spectrum in 250 Hz bands on every 2nd frame, for bandwidth estimation
-        sidx = np.arange(0, n, PITCH_EVERY)
-        spec = np.abs(np.fft.rfft(fr[sidx] * _HANN, SPEC_N, axis=1)) ** 2
-        band_rows.append((spec @ _BAND_MATRIX).astype(np.float32))
-        band_frames.append(sidx + frame_pos)
-        frame_pos += n
-        chunk_frames.append(n)
+    spans = segments or [(None, max_seconds)]
+    seg_bounds, chunk_spans = [0], []
+    for seg_start, seg_dur in spans:
+      for ci, x in enumerate(decode_chunks(path, ffmpeg, start=seg_start, max_seconds=seg_dur, status=status,
+                                           fast_seek=bool(segments))):
+          if STOP.is_set():
+              raise _Stopped()
+          n = len(x) // FRAME
+          if n == 0:
+              continue
+          xi = x[:n * FRAME]
+          total_samples += len(xi)
+          clipped += int(np.count_nonzero(np.abs(xi.astype(np.int32)) >= CLIP_LEVEL))
+          xf = xi.astype(np.float32) / 32768.0
+          fr = xf.reshape(n, FRAME)
+          dbs.append(10.0 * np.log10(np.mean(fr * fr, axis=1) + 1e-10))
+          if vad is not None:
+              vads.append(np.fromiter(
+                  (vad.is_speech(xi[i * FRAME:(i + 1) * FRAME].tobytes(), SR) for i in range(n)),
+                  dtype=bool, count=n))
+          f0 = np.full(n, np.nan, dtype=np.float32)
+          if do_pitch:
+              starts = np.arange(0, n, PITCH_EVERY) * FRAME
+              starts = starts[starts + FRAME + MAX_LAG <= len(xf)]
+              if len(starts):
+                  win = sliding_window_view(xf, FRAME + MAX_LAG)[starts]
+                  f0[starts // FRAME] = yin_f0(win)
+          f0s.append(f0)
+          # spectrum in 250 Hz bands on every 2nd frame, for bandwidth estimation
+          sidx = np.arange(0, n, PITCH_EVERY)
+          spec = np.abs(np.fft.rfft(fr[sidx] * _HANN, SPEC_N, axis=1)) ** 2
+          band_rows.append((spec @ _BAND_MATRIX).astype(np.float32))
+          band_frames.append(sidx + frame_pos)
+          frame_pos += n
+          chunk_frames.append(n)
+          chunk_spans.append([round((seg_start or 0) + ci * CHUNK_SECONDS, 3), round(n * FRAME / SR, 3)])
+      seg_bounds.append(frame_pos)
 
     if total_samples == 0:
         failed = status.get("returncode", 0) != 0
@@ -481,7 +495,11 @@ def analyze_file(path, ffmpeg, vad_method, max_seconds, do_pitch, keep_frames=Fa
         if len(within):
             bandwidth = int((within.max() + 1) * BAND_HZ)
 
-    run_s, pauses = speech_runs(speech)
+    run_s, pauses = [], 0
+    for sa, sb in zip(seg_bounds[:-1], seg_bounds[1:]):     # runs never span two clips
+        rs, ps = speech_runs(speech[sa:sb])
+        run_s.extend(rs.tolist())
+        pauses += ps
     run_counts = [0] * len(RUN_BUCKETS)
     run_time = [0.0] * len(RUN_BUCKETS)
     for length in run_s:
@@ -516,6 +534,7 @@ def analyze_file(path, ffmpeg, vad_method, max_seconds, do_pitch, keep_frames=Fa
         "run_time_s": [round(t, 2) for t in run_time],
         "pauses": int(pauses),
         "decode_warning": status.get("returncode", 0) != 0,
+        **({"chunk_spans": chunk_spans, "clips": len(spans)} if segments else {}),
     }
 
 
@@ -1243,11 +1262,12 @@ def classify_window(probs):
 
 def lid_for_file(path, ffmpeg, analysis, model, k):
     windows = []
+    spans = analysis.get("chunk_spans")
     for ci in lid_windows(analysis, k):
         if STOP.is_set():
             raise _Stopped()
-        chunks = list(decode_chunks(path, ffmpeg, start=ci * CHUNK_SECONDS,
-                                    max_seconds=CHUNK_SECONDS))
+        start, dur = spans[ci] if spans else (ci * CHUNK_SECONDS, CHUNK_SECONDS)
+        chunks = list(decode_chunks(path, ffmpeg, start=start, max_seconds=dur, fast_seek=bool(spans)))
         if not chunks:
             continue
         audio = np.concatenate(chunks).astype(np.float32) / 32768.0
@@ -1626,6 +1646,8 @@ def build_report(n_media, other_ext, records, dup_count, settings, lid, label_st
     other_top = dict(Counter({e: n for e, n in other_ext.items()
                               if e not in TRANSCRIPT_EXT and e not in MANIFEST_EXT}).most_common(15))
 
+    if not analyzed:          # e.g. metadata only: say "not measured" rather than zero
+        est_speech_h = child_speech_h = mostly_child_h = None
     return {
         "tool": {"name": "asr_feasibility", "version": TOOL_VERSION,
                  "run_date": dt.date.today().isoformat(),
@@ -1638,14 +1660,14 @@ def build_report(n_media, other_ext, records, dup_count, settings, lid, label_st
             "total_audio_hours": round(total_audio_h, 2),
             "files_acoustically_analyzed": len(analyzed),
             "hours_in_analyzed_files": round(analyzed_h, 2),
-            "estimated_speech_hours": round(est_speech_h, 2),
+            "estimated_speech_hours": None if est_speech_h is None else round(est_speech_h, 2),
             "estimated_child_range_speech_hours": child_speech_h,
             "speech_hours_in_mostly_child_files": mostly_child_h,
             "share_of_audio_hours_with_snr_below_10db":
                 round(low_snr_h / analyzed_h, 3) if analyzed_h else None,
             "share_of_audio_hours_narrowband":
                 round(narrow_h / analyzed_h, 3) if analyzed_h else None,
-            "files_with_frequent_clipping": clip_c.get(CLIP_BUCKETS[-1][1], 0),
+            "files_with_frequent_clipping": clip_c.get(CLIP_BUCKETS[-1][1], 0) if analyzed else None,
             "share_of_speech_in_runs_over_30s": long_share,
             "recordings_with_matching_caption_files": len(cap_recs),
             "caption_covered_hours": round(caption_h, 2),
@@ -1760,17 +1782,20 @@ def render_text(rep):
         L.append("  found. Recordings inside archives are not scanned; extract them and run")
         L.append("  the tool again to include them.\n")
     L.append("QUICK SUMMARY")
+    none_text = ("n/a (no audio analyzed)" if not s["files_acoustically_analyzed"]
+                 else "n/a (pitch analysis off)")
     rows = [
         ("Media files found", s["media_files_found"]),
         ("Duplicate copies skipped", s["duplicate_files_skipped"]),
         ("Files with an audio track", s["files_with_audio"]),
         ("Total audio", f"{s['total_audio_hours']} hours"),
-        ("Estimated speech", f"{s['estimated_speech_hours']} hours"),
-        ("Est. speech in child pitch range", _hours(s["estimated_child_range_speech_hours"])),
-        ("Speech in mostly-child files", _hours(s["speech_hours_in_mostly_child_files"])),
+        ("Estimated speech", _hours(s["estimated_speech_hours"], "n/a (no audio analyzed)")),
+        ("Est. speech in child pitch range", _hours(s["estimated_child_range_speech_hours"], none_text)),
+        ("Speech in mostly-child files", _hours(s["speech_hours_in_mostly_child_files"], none_text)),
         ("Audio with SNR below 10 dB", _pct(s["share_of_audio_hours_with_snr_below_10db"])),
         ("Audio that is narrowband", _pct(s["share_of_audio_hours_narrowband"])),
-        ("Files with frequent clipping", s["files_with_frequent_clipping"]),
+        ("Files with frequent clipping", "n/a" if s["files_with_frequent_clipping"] is None
+         else s["files_with_frequent_clipping"]),
         ("Speech in runs over 30 s", _pct(s["share_of_speech_in_runs_over_30s"])),
         ("Recordings with caption files", s["recordings_with_matching_caption_files"]),
         ("Hours covered by captions", f"{s['caption_covered_hours']} hours"),
