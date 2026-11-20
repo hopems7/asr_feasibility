@@ -215,6 +215,7 @@ class RangeRelay:
     wastes at most one piece. Counts the bytes actually fetched from Drive."""
 
     PIECE_START, PIECE_MAX = 256 * 1024, 8 * 1024 * 1024
+    PIECE_RETRIES = 3            # a piece that stalls or breaks off is re-fetched from where it stopped
 
     def __init__(self, drive):
         import http.server
@@ -222,6 +223,8 @@ class RangeRelay:
         import socketserver
         relay = self
         self.drive, self.bytes, self.requests, self._lock = drive, 0, 0, threading.Lock()
+        self.retried, self.failed = 0, 0     # pieces re-fetched after a timeout; requests given up
+        self.errors = {}                     # file id -> why Google didn't serve it
 
         def fetch(fid, lo, hi):
             with relay._lock:
@@ -248,12 +251,18 @@ class RangeRelay:
                 hi = start + piece - 1 if end is None else min(end, start + piece - 1)
                 try:
                     status, headers, chunks, close = fetch(fid, start, hi)
-                except Exception:
+                except Exception as e:
+                    relay.errors[fid] = describe_error(e)
                     self.send_error(502)
                     return
                 try:
                     cr = headers.get("Content-Range") or headers.get("content-range") or ""
                     total = int(cr.rsplit("/", 1)[1]) if "/" in cr and not cr.endswith("*") else None
+                    if status >= 400:
+                        body = b"".join(chunks)              # a short error message from Google
+                        why = google_reason(body)
+                        relay.errors[fid] = f"Google returned {status}" + (f" ({why})" if why else "")
+                        chunks = iter([body])
                     if status not in (200, 206) or total is None:
                         # error, or Drive ignored the range: pass the response through unchanged
                         self.send_response(status)
@@ -278,14 +287,36 @@ class RangeRelay:
                     self.end_headers()
                     if not body:
                         return
-                    pos = start
+                    pos, tries = start, 0
                     while True:
-                        for c in chunks:
-                            self.wfile.write(c)
-                            pos += len(c)
+                        try:
+                            for c in chunks:
+                                self.wfile.write(c)
+                                pos += len(c)
+                                with relay._lock:
+                                    relay.bytes += len(c)
+                        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                            raise                    # ffmpeg hung up: handled below
+                        except Exception:
+                            # Google's reply stalled or broke off: fetch the rest of this
+                            # piece again, from where it stopped, with a short wait
+                            close()
+                            tries += 1
+                            if tries > relay.PIECE_RETRIES or af.STOP.is_set():
+                                with relay._lock:
+                                    relay.failed += 1
+                                relay.errors[fid] = "Google's reply kept timing out"
+                                break
                             with relay._lock:
-                                relay.bytes += len(c)
+                                relay.retried += 1
+                            time.sleep(2 ** tries)
+                            try:
+                                status, headers, chunks, close = fetch(fid, pos, min(last, pos + piece - 1))
+                            except Exception:
+                                continue
+                            continue
                         close()
+                        tries = 0
                         if pos > last or af.STOP.is_set():
                             break
                         piece = min(piece * 2, relay.PIECE_MAX)
@@ -307,6 +338,11 @@ class RangeRelay:
             daemon_threads = True
             allow_reuse_address = True
 
+            def handle_error(self, request, client_address):
+                # never print tracebacks over the progress line; count instead
+                with relay._lock:
+                    relay.failed += 1
+
         self.server = Server(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -318,18 +354,24 @@ class RangeRelay:
         self.server.server_close()
 
 
-REFUSAL_LIMIT = 10      # stop after this many failed downloads in a row
+REFUSAL_LIMIT = 10      # after this many failures in a row, check whether Google is reachable
+FAILURE_PAUSE_S = 30    # while Google is unreachable, check this often (seconds)
+
+
+def google_reason(body):
+    """Google's error reason (e.g. 'userRateLimitExceeded') from an error response body."""
+    try:
+        err = json.loads(body.decode("utf-8", "replace") if isinstance(body, bytes) else body)["error"]
+        return (err.get("errors") or [{}])[0].get("reason") or err.get("status") or ""
+    except Exception:
+        return ""
 
 
 def describe_error(e):
     """A short description of a download error, including Google's reason if any
     (for example 'HttpError 403 (downloadQuotaExceeded)')."""
     status = getattr(getattr(e, "resp", None), "status", None) or getattr(e, "status_code", None)
-    reason = ""
-    try:
-        reason = e.error_details[0].get("reason", "")       # googleapiclient HttpError
-    except Exception:
-        reason = getattr(e, "reason", "") if isinstance(getattr(e, "reason", ""), str) else ""
+    reason = google_reason(getattr(e, "content", b""))
     return f"{type(e).__name__}" + (f" {status}" if status else "") + (f" ({reason})" if reason else "")
 
 
@@ -918,10 +960,12 @@ def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, 
     def process_metadata(r):
         if af.STOP.is_set():
             return None
+        relay.errors.pop(r["drive_id"], None)
         probe = probe_url(relay.url(r["drive_id"]))
         if not probe["ok"]:
+            reason = relay.errors.pop(r["drive_id"], None) or "its format couldn't be read"
             return {"probe": dict(af._empty_probe(), ok=True, has_audio=True), "analysis": None,
-                    "light": True, "probe_failed": True}
+                    "light": True, "probe_failed": True, "reason": reason}
         return {"probe": probe, "analysis": None, "light": True}
 
     def process_clips(r):
@@ -957,9 +1001,49 @@ def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, 
         except Exception:
             return process_full(r)
 
-    process = {"full": process_full, "clips": process_clips, "metadata": process_metadata}[mode]
+    process_one = {"full": process_full, "clips": process_clips, "metadata": process_metadata}[mode]
     fallbacks = {"n": 0}
     watch = RefusalWatch()
+    pause = {"until": 0.0, "resumed": 0.0}
+    failed_now, noted = [], set()     # recordings not fetched this run; failure reasons already shown
+    PAUSE_S = FAILURE_PAUSE_S
+
+    def process(r):
+        # after a run of refusals, wait before trying more (a dropped connection or
+        # Google pushing back), instead of marking every remaining recording as failed
+        while time.time() < pause["until"]:
+            if af.STOP.is_set():
+                return None
+            time.sleep(1)
+        r["_started"] = time.time()
+        return process_one(r)
+
+    def google_reachable():
+        """A quick check that Google Drive answers: reading the folder's own details."""
+        try:
+            drive.get(root_id)
+            return True
+        except Exception:
+            return False
+
+    def note_failure(reason):
+        reason = reason or "unknown error"
+        if reason not in noted:        # one short line per kind of failure, never a traceback
+            noted.add(reason)
+            print(f"\n  Note: a recording couldn't be fetched ({reason}). Continuing; "
+                  f"recordings like this are retried at the end of the run.")
+
+    def show_progress():
+        extra = f", {len(failed_now)} not fetched" if failed_now else ""
+        if mode == "metadata":
+            print(f"  {done}/{len(order)} headers read, {relay.bytes / 1e6:.0f} MB fetched{extra}, "
+                  f"{(time.time() - t0) / 60:.1f} min   ", end="\r", flush=True)
+        else:
+            fetched = dl_bytes + (relay.bytes if relay else 0)
+            print(f"  {done}/{len(order)} recordings, {fetched / 1e9:.1f} GB "
+                  f"{'downloaded' if mode == 'full' else 'fetched'}{extra}, "
+                  f"{hours:.1f} h analyzed, {(time.time() - t0) / 60:.1f} min   ", end="\r", flush=True)
+
     if pending:
         print({"full": f"Downloading and analyzing {len(pending)} recordings "
                        f"(each is deleted right after analysis)...",
@@ -969,50 +1053,73 @@ def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, 
     hours, dl_bytes = 0.0, 0
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
         try:
-            futs = {ex.submit(process, r): r for r in pending}
-            for fut in as_completed(futs):
-                r, res = futs[fut], fut.result()
-                if res is None:
-                    continue
-                if res.get("light"):                    # metadata-only
-                    r["probe"], r["light_probe"] = res["probe"], True
-                    if not res.get("probe_failed"):
-                        ckpt.save_probe(r["key"], r["probe"])
-                    if watch.record(bool(res.get("probe_failed")), "headers could not be read"):
-                        af.STOP.set()
-                        ex.shutdown(wait=True, cancel_futures=True)
-                        ckpt.close()
-                        print(watch.message())
-                        return af.finish(interactive, 2)
-                    done += 1
-                    print(f"  {done}/{len(order)} headers read, "
-                          f"{relay.bytes / 1e6:.0f} MB fetched, {(time.time() - t0) / 60:.1f} min   ",
-                          end="\r", flush=True)
-                    continue
-                if mode == "clips" and res.get("full_bytes"):
-                    fallbacks["n"] += 1
-                r["probe"], r["analysis"] = res["probe"], res["analysis"]
-                refused = r["analysis"].get("status") == "download_error"
-                if not refused:                                       # refused ones are retried next run
-                    ckpt.save_probe(r["key"], r["probe"])
-                    ckpt.save_analysis(r["key"], r["analysis"])
-                if watch.record(refused, r["analysis"].get("error_detail", "")):
-                    af.STOP.set()
-                    ex.shutdown(wait=True, cancel_futures=True)
-                    ckpt.close()
-                    print(watch.message())
-                    return af.finish(interactive, 2)
-                if lid_sig and res.get("lid") is not None:
-                    r["lid"] = res["lid"]
-                    ckpt.save_lid(f"{r['key']}|{lid_sig}", res["lid"])
-                done += 1
-                dl_bytes += res.get("full_bytes", 0)
-                hours += r["analysis"].get("analyzed_s", 0) / 3600
-                fetched = dl_bytes + (relay.bytes if relay else 0)
-                print(f"  {done}/{len(order)} recordings, {fetched / 1e9:.1f} GB "
-                      f"{'downloaded' if mode == 'full' else 'fetched'}, "
-                      f"{hours:.1f} h analyzed, {(time.time() - t0) / 60:.1f} min   ",
-                      end="\r", flush=True)
+            batch = pending
+            for attempt in (1, 2):           # a second pass retries what couldn't be fetched
+                if attempt == 2:
+                    if not failed_now or af.STOP.is_set():
+                        break
+                    batch, failed_now[:] = list(failed_now), []
+                    print(f"\n\nRetrying {len(batch)} recordings that couldn't be fetched...")
+                futs = {ex.submit(process, r): r for r in batch}
+                for fut in as_completed(futs):
+                    r, res = futs[fut], fut.result()
+                    if res is None:
+                        continue
+                    if res.get("light"):                    # metadata-only
+                        r["probe"], r["light_probe"] = res["probe"], True
+                        failed = bool(res.get("probe_failed"))
+                        reason = res.get("reason", "")
+                        if failed:
+                            failed_now.append(r)
+                            note_failure(reason)
+                        else:
+                            ckpt.save_probe(r["key"], r["probe"])
+                            done += 1
+                    else:
+                        if mode == "clips" and res.get("full_bytes"):
+                            fallbacks["n"] += 1
+                        r["probe"], r["analysis"] = res["probe"], res["analysis"]
+                        failed = r["analysis"].get("status") == "download_error"
+                        reason = r["analysis"].get("error_detail", "")
+                        if failed:                      # not saved as done, so retried
+                            failed_now.append(r)
+                            note_failure(reason)
+                        else:
+                            ckpt.save_probe(r["key"], r["probe"])
+                            ckpt.save_analysis(r["key"], r["analysis"])
+                            if lid_sig and res.get("lid") is not None:
+                                r["lid"] = res["lid"]
+                                ckpt.save_lid(f"{r['key']}|{lid_sig}", res["lid"])
+                            done += 1
+                            dl_bytes += res.get("full_bytes", 0)
+                            hours += r["analysis"].get("analyzed_s", 0) / 3600
+                    # attempts that began before the connection came back don't count toward
+                    # judging whether the files themselves are the problem
+                    if failed and r.get("_started", 0) < pause["resumed"]:
+                        show_progress()
+                        continue
+                    if watch.record(failed, reason):
+                        watch.run = 0
+                        if google_reachable():
+                            if "streak" not in noted:
+                                noted.add("streak")
+                                print(f"\n  {REFUSAL_LIMIT} recordings in a row couldn't be fetched ({watch.last}), "
+                                      f"but Google is reachable,\n  so these files themselves are the problem. "
+                                      f"Continuing without waiting.")
+                        else:
+                            pause["until"] = float("inf")       # hold new work until the connection is back
+                            print(f"\n  Google can't be reached ({watch.last}). Waiting for the connection "
+                                  f"to return, checking every {PAUSE_S} s...")
+                            waited = time.time()
+                            while not google_reachable():
+                                if af.STOP.is_set():
+                                    break
+                                time.sleep(PAUSE_S)
+                            pause["until"] = 0.0
+                            pause["resumed"] = time.time()
+                            watch.run = 0
+                            print(f"  Connection back after {(time.time() - waited) / 60:.0f} min. Continuing.")
+                    show_progress()
         except KeyboardInterrupt:
             af.STOP.set()
             ex.shutdown(wait=True, cancel_futures=True)
@@ -1054,6 +1161,9 @@ def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, 
         "recordings_not_downloadable": sum(1 for r in records if not r["can_download"]),
         "gb_downloaded_this_run": round((dl_bytes + (relay.bytes if relay else 0)) / 1e9, 3),
         "recordings_downloaded_in_full_as_fallback": fallbacks["n"] if mode == "clips" else 0,
+        "recordings_not_fetched_this_run": len(failed_now),
+        "relay_pieces_refetched_after_timeouts": relay.retried if relay else 0,
+        "relay_requests_given_up": relay.failed if relay else 0,
         "durations_from_drive_metadata": sum(1 for r in records if r["drive_duration_s"]
                                              and not (r.get("analysis") or {}).get("status") == "ok"),
         "durations_estimated_from_file_size": estimated,
@@ -1086,7 +1196,7 @@ def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, 
     txt_path = out_dir / "feasibility_report.txt"
     af.write_atomic(json_path, json.dumps(report, indent=2))
     af.write_atomic(txt_path, text)
-    ckpt.close(delete=not args.keep_checkpoint)
+    ckpt.close(delete=not args.keep_checkpoint and not failed_now)
     if relay:
         relay.close()
     if args.per_file:
@@ -1100,8 +1210,1237 @@ def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, 
 
     print(f"\nDone in {(time.time() - t0) / 60:.1f} minutes.")
     print(f"Report written to:\n  {txt_path}\n  {json_path}")
+    if failed_now:
+        print(f"\n{len(failed_now)} recordings couldn't be fetched, even after a retry. They're counted "
+              f"in the report\nwithout their audio analysis. Progress has been kept: run the same "
+              f"command again\nto retry just those.")
     print("\nPlease open the .txt report and read it before sharing the two report files.")
-    return af.finish(interactive, 0)
+    return af.finish(interactive, 3 if failed_now else 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())#!/usr/bin/env python3
+"""
+ASR data feasibility check for Google Drive
+===========================================
+
+Runs the same analysis as asr_feasibility.py on recordings stored in a Google
+Drive folder (My Drive or a shared drive), including all subfolders.
+
+How it works
+------------
+1. Signs in to Google with read-only access (a browser window opens once).
+2. Lists every file in the folder tree. This uses only Drive metadata, so the
+   inventory, file sizes, video durations and duplicates are known without
+   downloading anything. Exact duplicates (same content) are downloaded once.
+3. Downloads small label files only: caption files, JSON/CSV/TSV manifests, and
+   Google Sheets (exported as CSV). Google Docs are counted by name, not opened.
+4. Downloads each recording to a temporary folder, analyzes it, and deletes it
+   straight away. Only one recording per worker is on disk at any time.
+5. Writes the same aggregate report as asr_feasibility.py.
+
+Use --sample-files or --max-download-gb to limit how much is downloaded on a
+slow or metered connection. Files not downloaded still count toward totals
+(video durations come from Drive; audio-only durations are estimated from file
+size), and speech figures are extrapolated from the analyzed sample.
+
+Privacy
+-------
+* Read-only access. Nothing in Drive is changed, moved or shared.
+* Downloads go to a temporary folder on this computer and are deleted after
+  each file is analyzed; the folder itself is removed at the end.
+* The report contains only totals and distributions, exactly as for
+  asr_feasibility.py: no file names, folder names, transcripts or audio.
+* The sign-in token is stored on this computer only, and deleted after a
+  successful run unless --keep-login is given. Access can also be revoked at
+  https://myaccount.google.com/permissions
+
+Setup (once, by the engineer): see README.md, "Google Drive". In short, create
+an OAuth client of type "Desktop app" in a Google Cloud project and save its
+JSON file as client_secret.json next to this script.
+
+Usage
+-----
+    python drive_feasibility.py                         # asks for the folder link
+    python drive_feasibility.py "https://drive.google.com/drive/folders/XXXX"
+    python drive_feasibility.py FOLDER_LINK --max-download-gb 20
+    python drive_feasibility.py FOLDER_LINK --sample-files 300 --language-id
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import re
+import shutil
+import sys
+import tempfile
+import threading
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))   # bundled code
+# Folder the user sees: next to the .exe when frozen, else next to this script.
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else \
+    Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import asr_feasibility as af  # noqa: E402  (shared analysis and reporting)
+
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+FOLDER_MIME = "application/vnd.google-apps.folder"
+SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
+GDOC_MIME = "application/vnd.google-apps.document"
+GSHEET_MIME = "application/vnd.google-apps.spreadsheet"
+LIST_FIELDS = ("nextPageToken, files(id, name, mimeType, size, md5Checksum, createdTime, "
+               "modifiedTime, driveId, videoMediaMetadata(durationMillis), "
+               "shortcutDetails(targetId, targetMimeType), capabilities(canDownload))")
+FILE_FIELDS = LIST_FIELDS[len("nextPageToken, files("):-1]
+CAPTION_MAX_BYTES = 50_000_000
+MIME_EXT = {"audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/wav": ".wav", "audio/x-wav": ".wav",
+            "audio/wave": ".wav", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/aac": ".aac",
+            "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/webm": ".webm", "audio/flac": ".flac",
+            "audio/x-flac": ".flac", "audio/amr": ".amr", "audio/3gpp": ".3gp",
+            "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm",
+            "video/3gpp": ".3gp", "video/x-msvideo": ".avi", "video/x-matroska": ".mkv",
+            "video/mpeg": ".mpg", "video/x-ms-wmv": ".wmv"}
+TOKEN_PATH = Path.home() / ".asr_feasibility" / "drive_token__LOCAL_ONLY.json"
+UNKNOWN_DRIVE = "?"            # list_children: look up which drive a folder is on
+LIST_WORKERS = 8               # folders listed at the same time (well within Drive quotas)
+
+
+# ---------------------------------------------------------------------------
+# Google Drive access
+# ---------------------------------------------------------------------------
+class DriveClient:
+    """Thin read-only wrapper over the Drive v3 API. One API client per thread,
+    since the underlying HTTP library is not thread-safe."""
+
+    def __init__(self, client_secret, token_path=TOKEN_PATH):
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+
+        self.token_path = token_path
+        creds = None
+        if token_path.exists():
+            try:
+                creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+            except Exception:
+                creds = None
+        if creds and creds.expired and creds.refresh_token:
+            from google.auth.exceptions import TransportError
+            try:
+                creds.refresh(Request())
+            except TransportError:
+                # Google couldn't be reached (no internet): don't open a sign-in page,
+                # which would wait forever in an unattended run; exit so it can retry
+                raise SystemExit("Couldn't reach Google to renew the sign-in. Check the internet "
+                                 "connection and try again; progress is kept.")
+            except Exception:
+                creds = None  # e.g. a testing-mode token older than 7 days: sign in again
+        if not creds or not creds.valid:
+            if not Path(client_secret).exists():
+                raise SystemExit(f"Sign-in file not found: {client_secret}\n"
+                                 "See README.md, 'Google Drive', for how to create it.")
+            print("A browser window will open. Sign in with the Google account that can see")
+            print("the recordings, and allow read-only access to Google Drive.")
+            flow = InstalledAppFlow.from_client_secrets_file(str(client_secret), SCOPES)
+            creds = flow.run_local_server(port=0, open_browser=True,
+                                          authorization_prompt_message="If no browser opened, visit: {url}",
+                                          success_message="Signed in. You can close this tab.")
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(creds.to_json(), encoding="utf-8")
+        try:
+            os.chmod(token_path, 0o600)
+        except OSError:
+            pass
+        self.creds = creds
+        self._local = threading.local()
+
+    @property
+    def svc(self):
+        if not hasattr(self._local, "svc"):
+            from googleapiclient.discovery import build
+            self._local.svc = build("drive", "v3", credentials=self.creds, cache_discovery=False)
+        return self._local.svc
+
+    def get(self, file_id):
+        return self.svc.files().get(fileId=file_id, fields=FILE_FIELDS,
+                                    supportsAllDrives=True).execute(num_retries=5)
+
+    def list_children(self, folder_id, drive_id=None):
+        """Items directly inside a folder. Searches only the drive the folder is on
+        (its shared drive, or My Drive and files shared with the user) rather than
+        every shared drive the account can see, which can be much slower.
+        drive_id=UNKNOWN_DRIVE looks the folder's drive up first (for shortcuts)."""
+        if drive_id == UNKNOWN_DRIVE:
+            try:
+                drive_id = self.get(folder_id).get("driveId")
+            except Exception:
+                drive_id = None
+        scope = {"corpora": "drive", "driveId": drive_id} if drive_id else {"corpora": "user"}
+        out, token = [], None
+        while True:
+            resp = self.svc.files().list(
+                q=f"'{folder_id}' in parents and trashed = false", fields=LIST_FIELDS,
+                pageSize=1000, pageToken=token, supportsAllDrives=True,
+                includeItemsFromAllDrives=True, **scope).execute(num_retries=5)
+            out.extend(resp.get("files", []))
+            token = resp.get("nextPageToken")
+            if not token:
+                return out
+
+    def download(self, file_id, dest):
+        from googleapiclient.http import MediaIoBaseDownload
+        req = self.svc.files().get_media(fileId=file_id, supportsAllDrives=True)
+        with open(dest, "wb") as fh:
+            dl = MediaIoBaseDownload(fh, req, chunksize=8 * 1024 * 1024)
+            done = False
+            while not done:
+                if af.STOP.is_set():
+                    raise af._Stopped()
+                _, done = dl.next_chunk(num_retries=5)
+
+    def open_range(self, file_id, range_header=None):
+        """Start fetching a file's content, optionally only a byte range.
+        Returns (status, headers, chunk_iterator, close)."""
+        if not hasattr(self._local, "session"):
+            from google.auth.transport.requests import AuthorizedSession
+            self._local.session = AuthorizedSession(self.creds)
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&supportsAllDrives=true"
+        for attempt in range(6):                 # back off on rate limits and server errors
+            resp = self._local.session.get(url, headers={"Range": range_header} if range_header else {},
+                                           stream=True, timeout=60)
+            if resp.status_code not in (403, 429, 500, 502, 503, 504) or attempt == 5:
+                break
+            resp.close()
+            if af.STOP.is_set():
+                break
+            time.sleep(min(32, 2 ** attempt) + random.random())
+        return resp.status_code, dict(resp.headers), resp.iter_content(64 * 1024), resp.close
+
+    def export_csv(self, file_id, dest):
+        data = self.svc.files().export(fileId=file_id, mimeType="text/csv").execute(num_retries=5)
+        Path(dest).write_bytes(data)
+
+
+class RangeRelay:
+    """A small HTTP server on this computer (127.0.0.1 only) that passes ffmpeg's
+    byte-range requests on to Google Drive, so ffmpeg reads only what it needs:
+    the file's header and index, and the parts covering the requested clips.
+    Nothing is written to disk.
+
+    ffmpeg asks for "everything from byte N onwards" and simply hangs up once it
+    has enough, so the relay fetches from Drive in bounded pieces that grow while
+    ffmpeg keeps reading (256 KB, doubling up to 8 MB). An abandoned request then
+    wastes at most one piece. Counts the bytes actually fetched from Drive."""
+
+    PIECE_START, PIECE_MAX = 256 * 1024, 8 * 1024 * 1024
+    PIECE_RETRIES = 3            # a piece that stalls or breaks off is re-fetched from where it stopped
+
+    def __init__(self, drive):
+        import http.server
+        import socket
+        import socketserver
+        relay = self
+        self.drive, self.bytes, self.requests, self._lock = drive, 0, 0, threading.Lock()
+        self.retried, self.failed = 0, 0     # pieces re-fetched after a timeout; requests given up
+        self.errors = {}                     # file id -> why Google didn't serve it
+
+        def fetch(fid, lo, hi):
+            with relay._lock:
+                relay.requests += 1
+            return relay.drive.open_range(fid, f"bytes={lo}-{hi}" if hi is not None else f"bytes={lo}-")
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                # a small send buffer, so the relay can't run far ahead of ffmpeg
+                self.request.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)
+                super().setup()
+
+            def log_message(self, *a):
+                pass
+
+            def _serve(self, body=True):
+                fid = self.path.strip("/").split("?")[0]
+                m = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range") or "")
+                start = int(m.group(1)) if m else 0
+                end = int(m.group(2)) if m and m.group(2) else None
+                piece = relay.PIECE_START if body else 1
+                hi = start + piece - 1 if end is None else min(end, start + piece - 1)
+                try:
+                    status, headers, chunks, close = fetch(fid, start, hi)
+                except Exception as e:
+                    relay.errors[fid] = describe_error(e)
+                    self.send_error(502)
+                    return
+                try:
+                    cr = headers.get("Content-Range") or headers.get("content-range") or ""
+                    total = int(cr.rsplit("/", 1)[1]) if "/" in cr and not cr.endswith("*") else None
+                    if status >= 400:
+                        body = b"".join(chunks)              # a short error message from Google
+                        why = google_reason(body)
+                        relay.errors[fid] = f"Google returned {status}" + (f" ({why})" if why else "")
+                        chunks = iter([body])
+                    if status not in (200, 206) or total is None:
+                        # error, or Drive ignored the range: pass the response through unchanged
+                        self.send_response(status)
+                        for h in ("Content-Length", "Content-Range", "Content-Type"):
+                            v = headers.get(h) or headers.get(h.lower())
+                            if v:
+                                self.send_header(h, v)
+                        self.end_headers()
+                        if body:
+                            for c in chunks:
+                                self.wfile.write(c)
+                                with relay._lock:
+                                    relay.bytes += len(c)
+                        return
+                    last = total - 1 if end is None else min(end, total - 1)
+                    self.send_response(206 if m else 200)
+                    self.send_header("Content-Length", str(last - start + 1))
+                    if m:
+                        self.send_header("Content-Range", f"bytes {start}-{last}/{total}")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.end_headers()
+                    if not body:
+                        return
+                    pos, tries = start, 0
+                    while True:
+                        try:
+                            for c in chunks:
+                                self.wfile.write(c)
+                                pos += len(c)
+                                with relay._lock:
+                                    relay.bytes += len(c)
+                        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                            raise                    # ffmpeg hung up: handled below
+                        except Exception:
+                            # Google's reply stalled or broke off: fetch the rest of this
+                            # piece again, from where it stopped, with a short wait
+                            close()
+                            tries += 1
+                            if tries > relay.PIECE_RETRIES or af.STOP.is_set():
+                                with relay._lock:
+                                    relay.failed += 1
+                                relay.errors[fid] = "Google's reply kept timing out"
+                                break
+                            with relay._lock:
+                                relay.retried += 1
+                            time.sleep(2 ** tries)
+                            try:
+                                status, headers, chunks, close = fetch(fid, pos, min(last, pos + piece - 1))
+                            except Exception:
+                                continue
+                            continue
+                        close()
+                        tries = 0
+                        if pos > last or af.STOP.is_set():
+                            break
+                        piece = min(piece * 2, relay.PIECE_MAX)
+                        status, headers, chunks, close = fetch(fid, pos, min(last, pos + piece - 1))
+                        if status not in (200, 206):
+                            break
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass                         # ffmpeg had what it needed and hung up
+                finally:
+                    close()
+
+            def do_GET(self):
+                self._serve(True)
+
+            def do_HEAD(self):
+                self._serve(False)
+
+        class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+            def handle_error(self, request, client_address):
+                # never print tracebacks over the progress line; count instead
+                with relay._lock:
+                    relay.failed += 1
+
+        self.server = Server(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def url(self, file_id):
+        return f"http://127.0.0.1:{self.server.server_address[1]}/{file_id}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+REFUSAL_LIMIT = 10      # after this many failures in a row, check whether Google is reachable
+FAILURE_PAUSE_S = 30    # while Google is unreachable, check this often (seconds)
+
+
+def google_reason(body):
+    """Google's error reason (e.g. 'userRateLimitExceeded') from an error response body."""
+    try:
+        err = json.loads(body.decode("utf-8", "replace") if isinstance(body, bytes) else body)["error"]
+        return (err.get("errors") or [{}])[0].get("reason") or err.get("status") or ""
+    except Exception:
+        return ""
+
+
+def describe_error(e):
+    """A short description of a download error, including Google's reason if any
+    (for example 'HttpError 403 (downloadQuotaExceeded)')."""
+    status = getattr(getattr(e, "resp", None), "status", None) or getattr(e, "status_code", None)
+    reason = google_reason(getattr(e, "content", b""))
+    return f"{type(e).__name__}" + (f" {status}" if status else "") + (f" ({reason})" if reason else "")
+
+
+class RefusalWatch:
+    """Notices when Google Drive keeps refusing downloads, which usually means the
+    daily download limit has been reached or the connection has dropped."""
+
+    def __init__(self, limit=REFUSAL_LIMIT):
+        self.limit, self.run, self.last = limit, 0, ""
+
+    def record(self, failed, detail=""):
+        if failed:
+            self.run += 1
+            self.last = detail or self.last
+        else:
+            self.run = 0
+        return self.run >= self.limit
+
+    def message(self):
+        return (f"\n\nGoogle Drive has refused the last {self.run} downloads"
+                + (f" ({self.last})" if self.last else "") + ".\n"
+                "This usually means the daily download limit has been reached, or the internet\n"
+                "connection has dropped. Progress has been saved, and the refused recordings will\n"
+                "be retried: run the same command again later (for the daily limit, tomorrow).")
+
+
+def clip_spans(duration, clips, seconds):
+    """Evenly spaced clips through a recording, or None to analyze all of it
+    (recordings too short for clips to save anything)."""
+    if not duration or duration <= clips * seconds * 1.5:
+        return None
+    return [(round(duration * k / (clips + 1) - seconds / 2, 3), seconds) for k in range(1, clips + 1)]
+
+
+def make_client(args):
+    """Factory, so tests can substitute a local stand-in for Google Drive."""
+    return DriveClient(args.client_secret)
+
+
+def parse_folder_id(text):
+    text = (text or "").strip().strip('"')
+    for pat in (r"/folders/([A-Za-z0-9_-]{10,})", r"[?&]id=([A-Za-z0-9_-]{10,})"):
+        m = re.search(pat, text)
+        if m:
+            return m.group(1)
+    return text if re.fullmatch(r"[A-Za-z0-9_-]{10,}", text) else None
+
+
+# ---------------------------------------------------------------------------
+# Folder walk
+# ---------------------------------------------------------------------------
+def _safe(name):
+    return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip() or "_"
+
+
+def walk(drive, root_id, workers=LIST_WORKERS, follow_shortcuts=True, stats=None):
+    """All files under root_id and all its subfolders, with their relative paths.
+    Drive shortcuts are followed to their targets (which may be outside the
+    folder) unless follow_shortcuts is False, in which case they're skipped and
+    counted. Lists several folders at once and shows a running count.
+    Returns (items, folder_count); fills stats with shortcut counts if given."""
+    stats = {} if stats is None else stats
+    stats.update(shortcuts_followed=0, shortcuts_skipped=0)
+    from concurrent.futures import FIRST_COMPLETED, wait
+    try:
+        root_drive = drive.get(root_id).get("driveId")
+    except Exception:
+        root_drive = UNKNOWN_DRIVE
+    raw, visited = [], {root_id}
+    folders_done, t0, shown = 0, time.time(), 0.0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        pending = {ex.submit(drive.list_children, root_id, root_drive): ""}
+        try:
+            while pending:
+                if af.STOP.is_set():
+                    raise af._Stopped()
+                done, _ = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    rel = pending.pop(fut)
+                    children = fut.result()
+                    folders_done += 1
+                    for f in children:
+                        name = _safe(f.get("name", ""))
+                        if f.get("mimeType") == SHORTCUT_MIME:
+                            if not follow_shortcuts:
+                                stats["shortcuts_skipped"] += 1
+                                continue
+                            stats["shortcuts_followed"] += 1
+                            sd = f.get("shortcutDetails") or {}
+                            tid = sd.get("targetId")
+                            if not tid:
+                                continue
+                            if sd.get("targetMimeType") == FOLDER_MIME:
+                                if tid not in visited:
+                                    visited.add(tid)
+                                    pending[ex.submit(drive.list_children, tid, UNKNOWN_DRIVE)] = f"{rel}{name}/"
+                                continue
+                            try:
+                                f = drive.get(tid)
+                            except Exception:
+                                continue
+                            name = _safe(f.get("name", name))
+                        if f.get("mimeType") == FOLDER_MIME:
+                            if f["id"] not in visited:
+                                visited.add(f["id"])
+                                pending[ex.submit(drive.list_children, f["id"], f.get("driveId"))] = f"{rel}{name}/"
+                            continue
+                        raw.append((f"{rel}{name}", f))
+                if time.time() - shown >= 0.5 or not pending:
+                    shown = time.time()
+                    print(f"  Listing: {folders_done} folders scanned, {len(raw)} files found, "
+                          f"{len(pending)} folders waiting, {shown - t0:.0f} s   ", end="\r", flush=True)
+        except BaseException:
+            af.STOP.set()            # let queued listings return quickly
+            for fut in pending:
+                fut.cancel()
+            raise
+    print()
+    # Drive allows identical names in one folder; resolve them the same way every run
+    items, used = [], set()
+    for path, f in sorted(raw, key=lambda t: (t[0].lower(), t[1]["id"])):
+        if path.lower() in used:
+            p = Path(path)
+            path = str(p.with_name(f"{p.stem}~{f['id'][:6]}{p.suffix}")).replace(os.sep, "/")
+        used.add(path.lower())
+        items.append(dict(f, rel=path))
+    return items, len(visited)
+
+
+def media_ext(item):
+    ext = Path(item["name"]).suffix.lower()
+    if ext in af.AUDIO_EXT or ext in af.VIDEO_EXT:
+        return ext
+    if ext in af.TRANSCRIPT_EXT | af.MANIFEST_EXT | af.ARCHIVE_EXT:
+        return None   # e.g. Drive may label .ass subtitle files as audio/aac
+    mime = (item.get("mimeType") or "").lower()
+    if mime.startswith(("audio/", "video/")):
+        return MIME_EXT.get(mime, ".video" if mime.startswith("video/") else ".audio")
+    return None
+
+
+def drive_year(item):
+    years = []
+    for k in ("createdTime", "modifiedTime"):
+        m = re.match(r"(\d{4})-", item.get(k) or "")
+        if m:
+            years.append(int(m.group(1)))
+    y = min(years) if years else None
+    return y if y and 1995 <= y <= time.localtime().tm_year + 1 else None
+
+
+def fill_unanalyzed(records):
+    """Give recordings that weren't downloaded a duration so they count toward
+    totals: Drive's video duration, or for audio-only files an estimate from file
+    size. Also turns 'no audio' results into the no-audio-track state. Returns
+    the number of durations estimated from size."""
+    # bytes per second from analyzed files: same folder and type first (usually the
+    # same recorder and settings), then same type anywhere, then everything
+    bps_dir, bps = {}, {}
+    for r in records:
+        a = r.get("analysis") or {}
+        d = (r.get("probe") or {}).get("duration_s")
+        if d and r["size"] and a.get("status") == "ok":
+            bps_dir.setdefault((str(r["path"].parent), r["ext"]), []).append(r["size"] / d)
+            bps.setdefault(r["ext"], []).append(r["size"] / d)
+    all_bps = [v for vs in bps.values() for v in vs]
+    estimated = 0
+    for r in records:
+        if r.get("light_probe"):       # metadata-only: real format details, no audio analyzed
+            if not r["probe"].get("duration_s"):
+                r["probe"]["duration_s"] = r["drive_duration_s"]
+            r["analysis"] = None
+            continue
+        if r.get("probe") and r.get("analysis") is not None:
+            if r["analysis"].get("status") == "no_audio":
+                r["analysis"] = None   # treated like a file with no audio track
+            continue
+        dur = r["drive_duration_s"]
+        if dur is None:
+            ref = bps_dir.get((str(r["path"].parent), r["ext"])) or bps.get(r["ext"]) or all_bps
+            if ref and r["size"]:
+                dur = r["size"] / sorted(ref)[len(ref) // 2]
+                estimated += 1
+        r["probe"] = dict(af._empty_probe(), ok=True, has_audio=True, duration_s=dur)
+        r["analysis"] = None
+    return estimated
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description="ASR feasibility check for a Google Drive folder.")
+    ap.add_argument("folder", nargs="?", help="Drive folder link or ID (asks if omitted)")
+    ap.add_argument("--client-secret", default=str(APP_DIR / "client_secret.json"),
+                    help="OAuth client file (default: client_secret.json next to this program)")
+    ap.add_argument("--output", help="Report folder (default: ./asr_feasibility_output)")
+    ap.add_argument("--work-dir", help="Where to put temporary downloads (default: system temp)")
+    ap.add_argument("--sample-files", type=int, default=None,
+                    help="Download and analyze a random sample of this many recordings")
+    ap.add_argument("--max-download-gb", type=float, default=None,
+                    help="Stop selecting recordings once this much would be downloaded")
+    ap.add_argument("--max-minutes-per-file", type=float, default=None,
+                    help="Analyze at most this many minutes of each file (still downloads it)")
+    ap.add_argument("--metadata-only", action="store_true",
+                    help="Download no recordings: inventory from Drive's metadata plus the file "
+                         "headers needed for exact durations and formats")
+    ap.add_argument("--clips", type=int, default=None, metavar="N",
+                    help="Analyze N short clips spread through each recording, fetching only "
+                         "those parts instead of downloading whole files")
+    ap.add_argument("--clip-seconds", type=float, default=20.0,
+                    help="Length of each clip with --clips (default 20)")
+    ap.add_argument("--workers", type=int, default=2, help="Parallel downloads (default 2)")
+    ap.add_argument("--no-shortcuts", action="store_true",
+                    help="Don't follow Drive shortcuts, so nothing outside the folder (and its "
+                         "subfolders) is read; skipped shortcuts are counted in the report")
+    ap.add_argument("--vad", choices=["auto", "webrtc", "energy"], default="auto")
+    ap.add_argument("--no-pitch", action="store_true")
+    ap.add_argument("--language-id", action="store_true",
+                    help="Estimate English vs. non-English speech hours (needs faster-whisper)")
+    ap.add_argument("--lid-model", default="small")
+    ap.add_argument("--lid-windows-per-file", type=int, default=4)
+    ap.add_argument("--lid-max-windows", type=int, default=1500)
+    ap.add_argument("--fresh", action="store_true", help="Ignore saved progress")
+    ap.add_argument("--keep-checkpoint", action="store_true")
+    ap.add_argument("--keep-login", action="store_true",
+                    help="Keep the Google sign-in token after a successful run")
+    ap.add_argument("--per-file", action="store_true",
+                    help="Also write a LOCAL ONLY per-file table (not for sharing)")
+    ap.add_argument("--check", action="store_true",
+                    help="Check that everything needed is installed, then exit (no sign-in)")
+    args = ap.parse_args()
+    if args.check:
+        return self_check(args)
+    interactive = args.folder is None
+
+    print(f"ASR data feasibility check for Google Drive v{af.TOOL_VERSION}\n")
+    folder_text = args.folder
+    if not folder_text:
+        try:
+            folder_text = input("Paste the link to the Google Drive folder: ")
+        except EOFError:
+            folder_text = ""
+    root_id = parse_folder_id(folder_text)
+    if not root_id:
+        print("That doesn't look like a Google Drive folder link.")
+        return af.finish(interactive, 1)
+
+    ffmpeg = af.find_ffmpeg()
+    if not ffmpeg:
+        print("ffmpeg was not found. Install it, or run: pip install imageio-ffmpeg")
+        return af.finish(interactive, 1)
+    ffprobe = af.find_ffprobe(ffmpeg)
+    vad_method = args.vad
+    if vad_method in ("auto", "webrtc"):
+        try:
+            import webrtcvad  # noqa: F401
+            vad_method = "webrtc"
+        except ImportError:
+            vad_method = "energy"
+
+    out_dir = Path(args.output or (Path.cwd() / "asr_feasibility_output")).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="asr_drive_", dir=args.work_dir)).resolve()
+    shadow = work / "tree"      # mirrors the Drive folder structure for label matching
+    dl_dir = work / "downloads"
+    shadow.mkdir()
+    dl_dir.mkdir()
+    t0 = time.time()
+
+    try:
+        return run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir,
+                   work, shadow, dl_dir, t0)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def self_check(args, name="drive_feasibility", summary=True):
+    """Offline check of the installation: no sign-in and no network access."""
+    ok = True
+    def line(good, what, detail=""):
+        print(f"  [{'OK' if good else '!!'}] {what}{(': ' + detail) if detail else ''}")
+    print(f"{name} v{af.TOOL_VERSION} installation check")
+    ff = af.find_ffmpeg()
+    line(bool(ff), "ffmpeg", "bundled/installed" if ff else "missing")
+    ok &= bool(ff)
+    try:
+        import webrtcvad  # noqa: F401
+        line(True, "webrtcvad speech detector")
+    except ImportError:
+        line(False, "webrtcvad speech detector", "missing (energy-based detection will be used)")
+    try:
+        from googleapiclient.discovery import build
+        from google.oauth2.credentials import Credentials
+        import google_auth_oauthlib.flow  # noqa: F401
+        svc = build("drive", "v3", credentials=Credentials(token="offline-check"),
+                    cache_discovery=False, static_discovery=True)
+        line(hasattr(svc, "files"), "Google Drive API client (offline)")
+    except Exception as e:
+        line(False, "Google Drive API client", type(e).__name__)
+        ok = False
+    cs = Path(args.client_secret)
+    if cs.exists():
+        try:
+            kind = next(iter(json.loads(cs.read_text(encoding="utf-8"))))
+            line(kind == "installed", "client_secret.json",
+                 "Desktop app client" if kind == "installed" else
+                 f"'{kind}' client; create a Desktop app client instead")
+            ok &= kind == "installed"
+        except Exception:
+            line(False, "client_secret.json", "unreadable")
+            ok = False
+    else:
+        line(False, "client_secret.json", f"not found at {cs} (needed before signing in)")
+    if not summary:
+        return 0 if ok else 1
+    if not ok:
+        print("Some items need attention (see above).")
+    elif not cs.exists():
+        print("Ready, once client_secret.json is placed next to this program.")
+    else:
+        print("Ready.")
+    return 0 if ok else 1
+
+
+def run(args, interactive, root_id, ffmpeg, ffprobe, vad_method, out_dir, work, shadow, dl_dir, t0):
+    try:
+        drive = make_client(args)
+    except SystemExit as e:          # e.g. client_secret.json missing
+        print(e)
+        return af.finish(interactive, 1)
+    except KeyboardInterrupt:
+        return af.finish(interactive, 130)
+    except Exception as e:           # sign-in cancelled, browser closed, no network
+        print(f"Sign-in did not complete ({type(e).__name__}). Check the internet connection")
+        print("and try again; on the Google page, choose the account that can see the folder.")
+        return af.finish(interactive, 1)
+    print("Listing files in the Drive folder"
+          + (" (shortcuts are not followed)..." if args.no_shortcuts else "..."))
+    walk_stats = {}
+    try:
+        items, n_folders = walk(drive, root_id, follow_shortcuts=not args.no_shortcuts, stats=walk_stats)
+    except af._Stopped:
+        return af.finish(interactive, 130)
+    except Exception as e:
+        print(f"Could not list the folder ({type(e).__name__}). Check the link, and that the")
+        print("signed-in account can open it.")
+        return af.finish(interactive, 1)
+    print(f"  {len(items)} files in {n_folders} folders.")
+    if walk_stats["shortcuts_skipped"]:
+        print(f"  {walk_stats['shortcuts_skipped']} shortcuts skipped (--no-shortcuts).")
+
+    # --- sort into recordings and label files
+    media_items, caption_items, doc_paths, manifest_items = [], [], [], []
+    other_ext = Counter()
+    gdocs = gsheets = 0
+    for it in items:
+        mime = it.get("mimeType", "")
+        if mime == GDOC_MIME:                     # counted by name only; never opened
+            gdocs += 1
+            other_ext[".gdoc"] += 1
+            doc_paths.append(shadow / (it["rel"] + ".gdoc"))
+            continue
+        if mime == GSHEET_MIME:                   # exported as CSV and checked as a manifest
+            gsheets += 1
+            other_ext[".gsheet"] += 1
+            manifest_items.append((it, shadow / (it["rel"] + ".csv"), "sheet"))
+            continue
+        ext = media_ext(it)
+        if ext:
+            media_items.append((it, ext))
+            continue
+        fext = Path(it["name"]).suffix.lower() or "(no extension)"
+        other_ext[fext] += 1
+        if fext in af.CAPTION_EXT:
+            caption_items.append((it, shadow / it["rel"]))
+        elif fext in af.DOC_EXT:
+            doc_paths.append(shadow / it["rel"])
+        elif fext in af.MANIFEST_EXT:
+            manifest_items.append((it, shadow / it["rel"], "file"))
+
+    # --- download small label files (captions, manifests, Sheets as CSV)
+    def fetch(it, p, kind, limit):
+        if int(it.get("size") or 0) > limit or not (it.get("capabilities") or {}).get("canDownload", True):
+            return False
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if kind == "sheet":
+                drive.export_csv(it["id"], p)
+            else:
+                drive.download(it["id"], p)
+            return True
+        except af._Stopped:
+            raise
+        except Exception:
+            return False
+
+    labels, manifests, label_dl_failed = list(doc_paths), [], 0
+    if caption_items or manifest_items:
+        print(f"Downloading {len(caption_items) + len(manifest_items)} caption/manifest files (small)...")
+    try:
+        for it, p in caption_items:
+            if fetch(it, p, "file", CAPTION_MAX_BYTES):
+                labels.append(p)
+            else:
+                label_dl_failed += 1
+        for it, p, kind in manifest_items:
+            if fetch(it, p, kind, af.MANIFEST_MAX_BYTES):
+                manifests.append(p)
+            else:
+                label_dl_failed += 1
+    except af._Stopped:
+        return af.finish(interactive, 130)
+
+    # --- recording records (deduplicated by Drive's content checksum)
+    records, seen, aliases, dup_count = [], {}, [], 0
+    for it, ext in sorted(media_items, key=lambda t: t[0]["rel"]):
+        md5 = it.get("md5Checksum")
+        path = shadow / it["rel"]
+        if md5 and md5 in seen:
+            dup_count += 1
+            aliases.append((path, seen[md5]))
+            continue
+        mime = (it.get("mimeType") or "").lower()
+        dur_ms = (it.get("videoMediaMetadata") or {}).get("durationMillis")
+        rec = {"path": path, "display_path": it["rel"], "ext": ext, "size": int(it.get("size") or 0),
+               "key": hashlib.sha1(f"{it['id']}|{md5}|{it.get('modifiedTime')}".encode()).hexdigest()[:24],
+               "file_year": drive_year(it),
+               "kind": "video" if ext in af.VIDEO_EXT and not mime.startswith("audio/") else "audio",
+               "drive_id": it["id"], "drive_duration_s": int(dur_ms) / 1000 if dur_ms else None,
+               "can_download": (it.get("capabilities") or {}).get("canDownload", True)}
+        records.append(rec)
+        if md5:
+            seen[md5] = rec
+    if dup_count:
+        print(f"  {dup_count} duplicate copies will not be downloaded.")
+    if not records:
+        print("No audio or video files found in that folder.")
+        return af.finish(interactive, 1)
+
+    # --- choose what to download
+    if args.metadata_only and args.clips:
+        print("Use either --metadata-only or --clips, not both.")
+        return af.finish(interactive, 1)
+    mode = "metadata" if args.metadata_only else "clips" if args.clips else "full"
+
+    def est_bytes(r):
+        """Expected data to fetch for a recording in this mode (for --max-download-gb)."""
+        if mode == "clips" and r["drive_duration_s"]:
+            frac = min(1.0, args.clips * args.clip_seconds / r["drive_duration_s"])
+            return r["size"] * frac + min(r["size"], 2e6)       # clips plus header/index
+        return r["size"]
+
+    order = [r for r in records if r["can_download"]]
+    random.Random(0).shuffle(order)
+    if mode != "metadata":
+        if args.sample_files:
+            order = order[:args.sample_files]
+        if args.max_download_gb:
+            budget, chosen, used = args.max_download_gb * 1e9, [], 0
+            for r in order:
+                if used + est_bytes(r) <= budget:
+                    chosen.append(r)
+                    used += est_bytes(r)
+            order = chosen
+    total_gb = sum(r["size"] for r in records) / 1e9
+    sel_gb = sum(est_bytes(r) for r in order) / 1e9
+    if mode == "metadata":
+        print(f"Recordings: {len(records)} ({total_gb:.1f} GB). Metadata only: reading the headers "
+              f"of {len(order)} recordings, no audio is downloaded.")
+    elif mode == "clips":
+        print(f"Recordings: {len(records)} ({total_gb:.1f} GB). Selected for clip analysis: "
+              f"{len(order)} ({args.clips} x {args.clip_seconds:g} s each; roughly {sel_gb:.1f} GB to fetch).")
+    else:
+        print(f"Recordings: {len(records)} ({total_gb:.1f} GB). Selected for download and "
+              f"analysis: {len(order)} ({sel_gb:.1f} GB).")
+    relay = RangeRelay(drive) if mode != "full" else None
+
+    # --- checkpoint
+    max_s = args.max_minutes_per_file * 60 if args.max_minutes_per_file else None
+    lid_sig = af.lid_signature(args.lid_model, args.lid_windows_per_file) if args.language_id else None
+    ckpt_settings = {
+        "tool_version": af.TOOL_VERSION, "source": "google-drive",
+        "folder_id": hashlib.sha1(root_id.encode()).hexdigest()[:16],
+        "max_minutes_per_file": args.max_minutes_per_file, "speech_detector": vad_method,
+        "pitch_analysis": not args.no_pitch, "format_reader": "ffprobe" if ffprobe else "ffmpeg",
+        "language_id": lid_sig}
+    if mode == "metadata":
+        ckpt_settings = {"tool_version": af.TOOL_VERSION, "source": "google-drive", "mode": "metadata",
+                         "folder_id": ckpt_settings["folder_id"], "format_reader": ckpt_settings["format_reader"]}
+    elif mode == "clips":
+        ckpt_settings["mode"] = f"clips:{args.clips}x{args.clip_seconds:g}"
+    ckpt = af.Checkpoint(out_dir, ckpt_settings, fresh=args.fresh)
+    if ckpt.reason:
+        print(f"  Note: {ckpt.reason}.")
+
+    def interrupted():
+        ckpt.close()
+        print("\n\nStopped. Progress has been saved. Run the tool again with the same folder")
+        print("and settings and it will continue where it left off.")
+        return af.finish(interactive, 130)
+
+    # --- language model and window budget (files are processed in random order,
+    #     so stopping when the budget runs out gives a random sample)
+    model, lid_status = None, {"status": "not run (enable with --language-id)"}
+    lock, budget = threading.Lock(), {"used": 0}
+    if args.language_id and mode != "metadata":
+        model, err = af.load_lid_model(args.lid_model)
+        lid_status = {"status": err} if model is None else af.lid_meta(
+            args.lid_model, args.lid_windows_per_file, args.lid_max_windows, 0)
+
+    pending, done = [], 0
+    for r in order:
+        if mode == "metadata":
+            saved = ckpt.probes.get(r["key"])
+            if saved is not None:
+                r["probe"], r["light_probe"] = saved, True
+                done += 1
+            else:
+                pending.append(r)
+            continue
+        a = ckpt.analyses.get(r["key"])
+        if a is not None:
+            r["probe"] = ckpt.probes.get(r["key"]) or af._empty_probe()
+            r["analysis"] = a
+            lid = ckpt.lids.get(f"{r['key']}|{lid_sig}") if lid_sig else None
+            if lid is not None:
+                r["lid"] = lid
+                budget["used"] += len(lid.get("windows") or [])
+            done += 1
+        else:
+            pending.append(r)
+    if done:
+        print(f"  Resuming: {done} recordings already "
+              f"{'read' if mode == 'metadata' else 'analyzed'}, {len(pending)} remaining.")
+
+    def process_full(r):
+        if af.STOP.is_set():
+            return None
+        tmp = dl_dir / f"{r['key']}{r['ext'] if r['ext'] not in ('.audio', '.video') else ''}"
+        try:
+            try:
+                drive.download(r["drive_id"], tmp)
+            except af._Stopped:
+                return None
+            except Exception as e:
+                return {"probe": dict(af._empty_probe(), ok=True, has_audio=True),
+                        "analysis": {"status": "download_error", "error_detail": describe_error(e)}}
+            try:
+                probe = af.probe_ffprobe(tmp, ffprobe) if ffprobe else af.probe_ffmpeg_stderr(tmp, ffmpeg)
+            except Exception:
+                probe = af._empty_probe()
+            analysis = None
+            if probe["has_audio"]:
+                analysis = af.analyze_file(tmp, ffmpeg, vad_method, max_s, not args.no_pitch)
+                analysis.pop("_frames", None)
+            lid = None
+            if model is not None and analysis and analysis.get("status") == "ok":
+                n = len(af.lid_windows(analysis, args.lid_windows_per_file))
+                take = False
+                with lock:
+                    if n and budget["used"] + n <= args.lid_max_windows:
+                        budget["used"] += n
+                        take = True
+                lid = (af.lid_for_file(tmp, ffmpeg, analysis, model, args.lid_windows_per_file)
+                       if take else {"status": "not_selected", "windows": []})
+            return {"probe": probe, "analysis": analysis or {"status": "no_audio"}, "lid": lid,
+                    "full_bytes": r["size"]}
+        except af._Stopped:
+            return None
+        except Exception as e:
+            return {"probe": dict(af._empty_probe(), ok=True, has_audio=True),
+                    "analysis": {"status": "decode_error", "error_detail": type(e).__name__}}
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    def probe_url(url):
+        try:
+            return af.probe_ffprobe(url, ffprobe) if ffprobe else af.probe_ffmpeg_stderr(url, ffmpeg)
+        except Exception:
+            return af._empty_probe()
+
+    def process_metadata(r):
+        if af.STOP.is_set():
+            return None
+        relay.errors.pop(r["drive_id"], None)
+        probe = probe_url(relay.url(r["drive_id"]))
+        if not probe["ok"]:
+            reason = relay.errors.pop(r["drive_id"], None) or "its format couldn't be read"
+            return {"probe": dict(af._empty_probe(), ok=True, has_audio=True), "analysis": None,
+                    "light": True, "probe_failed": True, "reason": reason}
+        return {"probe": probe, "analysis": None, "light": True}
+
+    def process_clips(r):
+        if af.STOP.is_set():
+            return None
+        url = relay.url(r["drive_id"])
+        try:
+            probe = probe_url(url)
+            if not probe["ok"]:
+                return process_full(r)                  # can't stream it: download instead
+            if not probe["has_audio"]:
+                return {"probe": probe, "analysis": {"status": "no_audio"}}
+            dur = probe.get("duration_s") or r["drive_duration_s"]
+            spans = clip_spans(dur, args.clips, args.clip_seconds)
+            a = af.analyze_file(url, ffmpeg, vad_method, None if spans else max_s,
+                                not args.no_pitch, segments=spans)
+            a.pop("_frames", None)
+            if a.get("status") != "ok":
+                return process_full(r)
+            lid = None
+            if model is not None:
+                n = len(af.lid_windows(a, args.lid_windows_per_file))
+                take = False
+                with lock:
+                    if n and budget["used"] + n <= args.lid_max_windows:
+                        budget["used"] += n
+                        take = True
+                lid = (af.lid_for_file(url, ffmpeg, a, model, args.lid_windows_per_file)
+                       if take else {"status": "not_selected", "windows": []})
+            return {"probe": probe, "analysis": a, "lid": lid}
+        except af._Stopped:
+            return None
+        except Exception:
+            return process_full(r)
+
+    process_one = {"full": process_full, "clips": process_clips, "metadata": process_metadata}[mode]
+    fallbacks = {"n": 0}
+    watch = RefusalWatch()
+    pause = {"until": 0.0, "resumed": 0.0}
+    failed_now, noted = [], set()     # recordings not fetched this run; failure reasons already shown
+    PAUSE_S = FAILURE_PAUSE_S
+
+    def process(r):
+        # after a run of refusals, wait before trying more (a dropped connection or
+        # Google pushing back), instead of marking every remaining recording as failed
+        while time.time() < pause["until"]:
+            if af.STOP.is_set():
+                return None
+            time.sleep(1)
+        r["_started"] = time.time()
+        return process_one(r)
+
+    def google_reachable():
+        """A quick check that Google Drive answers: reading the folder's own details."""
+        try:
+            drive.get(root_id)
+            return True
+        except Exception:
+            return False
+
+    def note_failure(reason):
+        reason = reason or "unknown error"
+        if reason not in noted:        # one short line per kind of failure, never a traceback
+            noted.add(reason)
+            print(f"\n  Note: a recording couldn't be fetched ({reason}). Continuing; "
+                  f"recordings like this are retried at the end of the run.")
+
+    def show_progress():
+        extra = f", {len(failed_now)} not fetched" if failed_now else ""
+        if mode == "metadata":
+            print(f"  {done}/{len(order)} headers read, {relay.bytes / 1e6:.0f} MB fetched{extra}, "
+                  f"{(time.time() - t0) / 60:.1f} min   ", end="\r", flush=True)
+        else:
+            fetched = dl_bytes + (relay.bytes if relay else 0)
+            print(f"  {done}/{len(order)} recordings, {fetched / 1e9:.1f} GB "
+                  f"{'downloaded' if mode == 'full' else 'fetched'}{extra}, "
+                  f"{hours:.1f} h analyzed, {(time.time() - t0) / 60:.1f} min   ", end="\r", flush=True)
+
+    if pending:
+        print({"full": f"Downloading and analyzing {len(pending)} recordings "
+                       f"(each is deleted right after analysis)...",
+               "clips": f"Analyzing clips from {len(pending)} recordings "
+                        f"(only the clips' parts of each file are fetched)...",
+               "metadata": f"Reading headers of {len(pending)} recordings..."}[mode])
+    hours, dl_bytes = 0.0, 0
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        try:
+            batch = pending
+            for attempt in (1, 2):           # a second pass retries what couldn't be fetched
+                if attempt == 2:
+                    if not failed_now or af.STOP.is_set():
+                        break
+                    batch, failed_now[:] = list(failed_now), []
+                    print(f"\n\nRetrying {len(batch)} recordings that couldn't be fetched...")
+                futs = {ex.submit(process, r): r for r in batch}
+                for fut in as_completed(futs):
+                    r, res = futs[fut], fut.result()
+                    if res is None:
+                        continue
+                    if res.get("light"):                    # metadata-only
+                        r["probe"], r["light_probe"] = res["probe"], True
+                        failed = bool(res.get("probe_failed"))
+                        reason = res.get("reason", "")
+                        if failed:
+                            failed_now.append(r)
+                            note_failure(reason)
+                        else:
+                            ckpt.save_probe(r["key"], r["probe"])
+                            done += 1
+                    else:
+                        if mode == "clips" and res.get("full_bytes"):
+                            fallbacks["n"] += 1
+                        r["probe"], r["analysis"] = res["probe"], res["analysis"]
+                        failed = r["analysis"].get("status") == "download_error"
+                        reason = r["analysis"].get("error_detail", "")
+                        if failed:                      # not saved as done, so retried
+                            failed_now.append(r)
+                            note_failure(reason)
+                        else:
+                            ckpt.save_probe(r["key"], r["probe"])
+                            ckpt.save_analysis(r["key"], r["analysis"])
+                            if lid_sig and res.get("lid") is not None:
+                                r["lid"] = res["lid"]
+                                ckpt.save_lid(f"{r['key']}|{lid_sig}", res["lid"])
+                            done += 1
+                            dl_bytes += res.get("full_bytes", 0)
+                            hours += r["analysis"].get("analyzed_s", 0) / 3600
+                    # attempts that began before the connection came back don't count toward
+                    # judging whether the files themselves are the problem
+                    if failed and r.get("_started", 0) < pause["resumed"]:
+                        show_progress()
+                        continue
+                    if watch.record(failed, reason):
+                        watch.run = 0
+                        if google_reachable():
+                            if "streak" not in noted:
+                                noted.add("streak")
+                                print(f"\n  {REFUSAL_LIMIT} recordings in a row couldn't be fetched ({watch.last}), "
+                                      f"but Google is reachable,\n  so these files themselves are the problem. "
+                                      f"Continuing without waiting.")
+                        else:
+                            pause["until"] = float("inf")       # hold new work until the connection is back
+                            print(f"\n  Google can't be reached ({watch.last}). Waiting for the connection "
+                                  f"to return, checking every {PAUSE_S} s...")
+                            waited = time.time()
+                            while not google_reachable():
+                                if af.STOP.is_set():
+                                    break
+                                time.sleep(PAUSE_S)
+                            pause["until"] = 0.0
+                            pause["resumed"] = time.time()
+                            watch.run = 0
+                            print(f"  Connection back after {(time.time() - waited) / 60:.0f} min. Continuing.")
+                    show_progress()
+        except KeyboardInterrupt:
+            af.STOP.set()
+            ex.shutdown(wait=True, cancel_futures=True)
+            return interrupted()
+    print()
+
+    estimated = fill_unanalyzed(records)
+
+    # --- labels and manifests
+    index = {(str(r["path"].parent), r["path"].stem.lower()): r for r in records}
+    for p, rec in aliases:
+        index.setdefault((str(p.parent), p.stem.lower()), rec)
+    label_stats = af.match_labels(labels, index) if labels else {}
+    manifest_stats = {}
+    if manifests:
+        manifest_stats = af.match_manifests(manifests, af.MediaIndex(shadow, records, aliases))
+
+    if model is not None:
+        lid_status["files_selected"] = sum(1 for r in records if (r.get("lid") or {}).get("status") == "ok")
+    settings = {
+        "source": "Google Drive",
+        "mode": {"full": "full download", "metadata": "metadata only (no audio analyzed)",
+                 "clips": f"{args.clips} clips of {args.clip_seconds:g} s per recording"}[mode],
+        "follow_shortcuts": not args.no_shortcuts,
+        "max_minutes_per_file": args.max_minutes_per_file,
+        "sample_files": args.sample_files or (len(order) if len(order) < len(records) else None),
+        "max_download_gb": args.max_download_gb,
+        "speech_detector": vad_method,
+        "pitch_analysis": not args.no_pitch,
+        "format_reader": "ffprobe" if ffprobe else "ffmpeg",
+        "language_id": args.language_id,
+    }
+    report = af.build_report(len(media_items), other_ext, records, dup_count, settings,
+                             lid_status, label_stats, manifest_stats)
+    drive_info = {
+        "folders_scanned": n_folders,
+        "files_listed": len(items),
+        "recordings_selected_for_download": len(order),
+        "recordings_not_downloadable": sum(1 for r in records if not r["can_download"]),
+        "gb_downloaded_this_run": round((dl_bytes + (relay.bytes if relay else 0)) / 1e9, 3),
+        "recordings_downloaded_in_full_as_fallback": fallbacks["n"] if mode == "clips" else 0,
+        "recordings_not_fetched_this_run": len(failed_now),
+        "relay_pieces_refetched_after_timeouts": relay.retried if relay else 0,
+        "relay_requests_given_up": relay.failed if relay else 0,
+        "durations_from_drive_metadata": sum(1 for r in records if r["drive_duration_s"]
+                                             and not (r.get("analysis") or {}).get("status") == "ok"),
+        "durations_estimated_from_file_size": estimated,
+        "google_docs_counted_by_name": gdocs,
+        "google_sheets_checked_as_manifests": gsheets,
+        "label_files_not_downloaded": label_dl_failed,
+        "shortcuts_followed": walk_stats["shortcuts_followed"],
+        "shortcuts_skipped": walk_stats["shortcuts_skipped"],
+    }
+    report["google_drive"] = drive_info
+    text = af.render_text(report)
+    extra = ["", "GOOGLE DRIVE SCAN"]
+    extra += [f"  {k.replace('_', ' ').capitalize()}: {v}" for k, v in drive_info.items()]
+    if mode == "metadata":
+        extra += ["  METADATA ONLY: no audio was analyzed. Durations and formats come from Drive's",
+                  "  metadata and each file's header, so totals, formats, lengths, labels and dates",
+                  "  are complete, but speech, quality, pitch and language sections are empty."]
+    elif mode == "clips":
+        extra += [f"  CLIPS: acoustic figures come from {args.clips} clips of {args.clip_seconds:g} s spread",
+                  "  through each recording (whole recordings if too short for clips to save data),",
+                  "  scaled to each recording's full length. Speech-run lengths are measured within",
+                  "  clips, so runs longer than a clip can't be seen."]
+    extra += ["  Recordings that were not downloaded count toward totals using their Drive",
+              "  video duration, or a duration estimated from file size for audio-only",
+              "  files. They are assumed to contain audio. Speech, quality and language",
+              "  figures come from the downloaded sample and are extrapolated."]
+    text += "\n".join(extra) + "\n"
+
+    json_path = out_dir / "feasibility_report.json"
+    txt_path = out_dir / "feasibility_report.txt"
+    af.write_atomic(json_path, json.dumps(report, indent=2))
+    af.write_atomic(txt_path, text)
+    ckpt.close(delete=not args.keep_checkpoint and not failed_now)
+    if relay:
+        relay.close()
+    if args.per_file:
+        local = af.write_per_file_csv(out_dir, records, shadow)
+        print(f"  Local-only per-file table: {local}")
+    if not args.keep_login:
+        try:
+            TOKEN_PATH.unlink()
+        except OSError:
+            pass
+
+    print(f"\nDone in {(time.time() - t0) / 60:.1f} minutes.")
+    print(f"Report written to:\n  {txt_path}\n  {json_path}")
+    if failed_now:
+        print(f"\n{len(failed_now)} recordings couldn't be fetched, even after a retry. They're counted "
+              f"in the report\nwithout their audio analysis. Progress has been kept: run the same "
+              f"command again\nto retry just those.")
+    print("\nPlease open the .txt report and read it before sharing the two report files.")
+    return af.finish(interactive, 3 if failed_now else 0)
 
 
 if __name__ == "__main__":
